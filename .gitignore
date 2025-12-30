@@ -7,7 +7,7 @@
 /logs
 /data
 .devcontainer
-rustfs/static/*
+#rustfs/static/*
 !rustfs/static/.gitkeep
 vendor
 cli/rustfs-gui/embedded-rustfs/rustfs
@@ -23,7 +23,7 @@ profile.json
 .secrets
 *.go
 *.pb
-*.svg
+#*.svg
 deploy/logs/*.log.*
 artifacts/
 # s3-tests local artifacts (root directory only)
