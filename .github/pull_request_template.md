@@ -2,36 +2,35 @@
 Pull Request Template for RustFS
 -->
 
-## Type of Change
-- [ ] New Feature
-- [ ] Bug Fix
-- [ ] Documentation
-- [ ] Performance Improvement
-- [ ] Test/CI
-- [ ] Refactor
-- [ ] Other:
-
 ## Related Issues
-<!-- List related Issue numbers, e.g. #123 -->
+<!--
+List related issues, e.g. Fixes #123.
+Use N/A when there is no related issue.
+-->
 
 ## Summary of Changes
-<!-- Briefly describe the main changes and motivation for this PR -->
+<!--
+Briefly explain what changed and why reviewers should accept it.
+Focus on behavior, compatibility, and review-relevant context.
+-->
 
-## Checklist
-- [ ] I have read and followed the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines
-- [ ] Passed `make pre-commit`
-- [ ] Added/updated necessary tests
-- [ ] Documentation updated (if needed)
-- [ ] CI/CD passed (if applicable)
+## Verification
+<!--
+List the commands or checks you ran, for example:
+- `make pre-commit`
+
+Use N/A only when verification is not applicable.
+-->
 
 ## Impact
-- [ ] Breaking change (compatibility)
-- [ ] Requires doc/config/deployment update
-- [ ] Other impact:
+<!--
+Describe user-facing, compatibility, API, deployment, configuration, or
+documentation impact. Use N/A when there is no expected impact.
+-->
 
 ## Additional Notes
-<!-- Any extra information for reviewers -->
+<!-- Any extra information for reviewers, or N/A. -->
 
 ---
 
-Thank you for your contribution! Please ensure your PR follows the community standards ([CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)) and sign the CLA if this is your first contribution.
+Thank you for your contribution! Please ensure your PR follows the community standards ([CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)). If this is your first contribution, review the [CLA document](https://github.com/rustfs/cla/blob/main/cla/v1.md) and sign it by commenting `I have read and agree to the CLA.` on the PR.

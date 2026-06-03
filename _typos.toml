@@ -37,6 +37,14 @@ datas = "datas"
 bre = "bre"
 abd = "abd"
 mak = "mak"
+gae = "gae"
+GAE = "GAE"
+thr = "thr"
+# s3-tests original test names (cannot be changed)
+nonexisted = "nonexisted"
+consts = "consts"
+# Swift API - company/product names
+Hashi = "Hashi"  # HashiCorp
 
 [files]
 extend-exclude = []

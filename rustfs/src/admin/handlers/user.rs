@@ -12,21 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::iam_error::iam_error_to_s3_error;
+use super::{account_info, group, service_account, user_iam, user_lifecycle, user_policy_binding};
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
+    admin::{
+        auth::validate_admin_request,
+        handlers::site_replication::site_replication_iam_change_hook,
+        router::{AdminOperation, Operation, S3Router},
+        utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
+    },
     auth::{check_key_valid, constant_time_eq, get_session_token},
     server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
-use rustfs_credentials::get_global_action_cred;
+use rustfs_credentials::{Credentials, get_global_action_cred};
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
-    sys::NewServiceAccountOpts,
+    sys::{NewServiceAccountOpts, UpdateServiceAccountOpts},
 };
 use rustfs_madmin::{
-    AccountStatus, AddOrUpdateUserReq, IAMEntities, IAMErrEntities, IAMErrEntity, IAMErrPolicyEntity,
+    AccountStatus, AddOrUpdateUserReq, IAMEntities, IAMErrEntities, IAMErrEntity, IAMErrPolicyEntity, SITE_REPL_API_VERSION,
+    SRIAMItem, SRIAMUser,
     user::{ImportIAMResult, SRSessionPolicy, SRSvcAccCreate},
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -40,14 +48,133 @@ use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::io::{Read as _, Write};
 use std::{collections::HashMap, io::Cursor, str::from_utf8};
-use tracing::warn;
+use tracing::{debug, warn};
 use zip::{ZipArchive, ZipWriter, result::ZipError, write::SimpleFileOptions};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AddUserQuery {
-    #[serde(rename = "accessKey")]
+    #[serde(rename = "accessKey", alias = "access-key")]
     pub access_key: Option<String>,
     pub status: Option<String>,
+}
+
+pub fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    account_info::register_account_info_route(r)?;
+    user_lifecycle::register_user_lifecycle_route(r)?;
+    group::register_group_management_route(r)?;
+    service_account::register_service_account_route(r)?;
+    user_iam::register_user_iam_route(r)?;
+    user_policy_binding::register_user_policy_binding_route(r)?;
+
+    Ok(())
+}
+
+/// Returns the IAM parent user identity for a temporary (Console/STS) session credential.
+///
+/// Prefers `parent_user` when non-empty; otherwise reads the JWT `parent` claim.
+/// Returns [`None`] when neither is available.
+fn temp_identity_parent(requester: &Credentials) -> Option<&str> {
+    if !requester.parent_user.is_empty() {
+        return Some(requester.parent_user.as_str());
+    }
+    requester
+        .claims
+        .as_ref()
+        .and_then(|c| c.get("parent"))
+        .and_then(|v| v.as_str())
+}
+
+/// How the IAM parent identity was resolved for logging (no JWT claim values).
+fn parent_identity_source(requester: &Credentials) -> &'static str {
+    if !requester.parent_user.is_empty() {
+        "parent_user_field"
+    } else if requester.claims.as_ref().and_then(|c| c.get("parent")).is_some() {
+        "jwt_parent"
+    } else {
+        "none"
+    }
+}
+
+/// Returns `true` when admin policy checks should use `deny_only` mode (only explicit **Deny** blocks;
+/// absence of **Allow** does not deny).
+///
+/// Eligible cases:
+/// - **Long-term credentials**: target is the requester's own `access_key` and there is no `parent_user`.
+/// - **Console/STS session (temp)**: target equals the IAM user this session represents, resolved via
+///   [`temp_identity_parent`] as `parent_user` when set, else the JWT claim `parent` (some stores
+///   persist only the token).
+///
+/// Service accounts always use full Allow/Deny evaluation.
+fn should_check_deny_only(target_access_key: &str, requester: &Credentials) -> bool {
+    if requester.is_service_account() {
+        return false;
+    }
+    if requester.is_temp() {
+        return temp_identity_parent(requester).is_some_and(|p| p == target_access_key);
+    }
+    target_access_key == requester.access_key && requester.parent_user.is_empty()
+}
+
+fn should_reject_group_import_name(group_name: &str, group_lookup: &rustfs_iam::error::Error) -> bool {
+    has_space_be(group_name) || !matches!(group_lookup, rustfs_iam::error::Error::NoSuchGroup(_))
+}
+
+fn should_restore_group_as_disabled(status: &str) -> bool {
+    status.eq_ignore_ascii_case(rustfs_iam::sys::STATUS_DISABLED)
+}
+
+fn imported_service_account_status(status: &str) -> Option<String> {
+    if status.eq_ignore_ascii_case(rustfs_policy::auth::ACCOUNT_OFF)
+        || status.eq_ignore_ascii_case(rustfs_madmin::AccountStatus::Disabled.as_ref())
+    {
+        return Some(rustfs_policy::auth::ACCOUNT_OFF.to_string());
+    }
+
+    if status.eq_ignore_ascii_case(rustfs_policy::auth::ACCOUNT_ON)
+        || status.eq_ignore_ascii_case(rustfs_madmin::AccountStatus::Enabled.as_ref())
+    {
+        return Some(rustfs_policy::auth::ACCOUNT_ON.to_string());
+    }
+
+    None
+}
+
+const SERVICE_ACCOUNT_PARENT_SCOPE_ERROR: &str = "service account parent is outside requester scope";
+const SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR: &str = "service account access key does not match import entry";
+
+fn imported_service_account_parent_allowed(parent: &str, requester: &Credentials, owner: bool) -> bool {
+    if parent.is_empty() {
+        return false;
+    }
+
+    if owner {
+        return true;
+    }
+
+    if requester.is_temp() || requester.is_service_account() {
+        return temp_identity_parent(requester).is_some_and(|requester_parent| requester_parent == parent);
+    }
+
+    requester.parent_user.is_empty() && requester.access_key == parent
+}
+
+fn imported_service_account_parent_scope_failure(
+    access_key: &str,
+    parent: &str,
+    requester: &Credentials,
+    owner: bool,
+) -> Option<IAMErrEntity> {
+    (!imported_service_account_parent_allowed(parent, requester, owner)).then(|| IAMErrEntity {
+        name: access_key.to_string(),
+        error: SERVICE_ACCOUNT_PARENT_SCOPE_ERROR.to_string(),
+    })
+}
+
+fn imported_service_account_access_key_failure(entry_access_key: &str, payload_access_key: &str) -> Option<IAMErrEntity> {
+    (entry_access_key != payload_access_key).then(|| IAMErrEntity {
+        name: entry_access_key.to_string(),
+        error: SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR.to_string(),
+    })
 }
 
 pub struct AddUser {}
@@ -77,14 +204,7 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let mut input = req.input;
-        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
-            }
-        };
+        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
 
         // let body_bytes = decrypt_data(input_cred.secret_key.expose().as_bytes(), &body)
         //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("decrypt_data err {}", e)))?;
@@ -96,10 +216,10 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        if let Some(sys_cred) = get_global_action_cred() {
-            if constant_time_eq(&sys_cred.access_key, ak) {
-                return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
-            }
+        if let Some(sys_cred) = get_global_action_cred()
+            && constant_time_eq(&sys_cred.access_key, ak)
+        {
+            return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
         }
 
         let Ok(iam_store) = rustfs_iam::get() else {
@@ -118,21 +238,55 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is not utf8"));
         }
 
-        let deny_only = ak == cred.access_key;
+        let check_deny_only = should_check_deny_only(ak, &cred);
+
+        debug!(
+            target = "rustfs::admin::handlers::user",
+            operation = "AddUser",
+            query_access_key = %ak,
+            signer_access_key = %cred.access_key,
+            is_temp = cred.is_temp(),
+            is_service_account = cred.is_service_account(),
+            parent_user = %cred.parent_user,
+            parent_identity_source = %parent_identity_source(&cred),
+            jwt_parent_claim_present = cred.claims.as_ref().and_then(|c| c.get("parent")).is_some(),
+            check_deny_only,
+            is_owner = owner,
+            "authorization context before validate_admin_request (no secrets)"
+        );
+
+        // For eligible self operations, only explicit Deny should block the request.
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            deny_only,
+            check_deny_only,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
-        iam_store
+        let updated_at = iam_store
             .create_user(ak, &args)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("create_user err {e}")))?;
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "iam-user".to_string(),
+            iam_user: Some(SRIAMUser {
+                access_key: ak.to_string(),
+                is_delete_req: false,
+                user_req: Some(args.clone()),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(access_key = %ak, error = ?err, "site replication create user hook failed");
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -178,7 +332,7 @@ impl Operation for SetUserStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -223,7 +377,7 @@ impl Operation for ListUsers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListUsersAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -257,9 +411,10 @@ impl Operation for ListUsers {
 
         let data = serde_json::to_vec(&users)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {e}")))?;
+        let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -282,7 +437,7 @@ impl Operation for RemoveUser {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -335,7 +490,22 @@ impl Operation for RemoveUser {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("delete_user err {e}")))?;
 
-        // TODO: IAMChangeHook
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "iam-user".to_string(),
+            iam_user: Some(SRIAMUser {
+                access_key: ak.to_string(),
+                is_delete_req: true,
+                user_req: None,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(time::OffsetDateTime::now_utc()),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(access_key = %ak, error = ?err, "site replication delete user hook failed");
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -375,21 +545,35 @@ impl Operation for GetUserInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let deny_only = ak == cred.access_key;
+        let check_deny_only = should_check_deny_only(ak, &cred);
+
+        debug!(
+            target = "rustfs::admin::handlers::user",
+            operation = "GetUserInfo",
+            query_access_key = %ak,
+            signer_access_key = %cred.access_key,
+            is_temp = cred.is_temp(),
+            is_service_account = cred.is_service_account(),
+            parent_user = %cred.parent_user,
+            parent_identity_source = %parent_identity_source(&cred),
+            jwt_parent_claim_present = cred.claims.as_ref().and_then(|c| c.get("parent")).is_some(),
+            check_deny_only,
+            is_owner = owner,
+            "authorization context before validate_admin_request (no secrets)"
+        );
+
+        // For eligible self operations, only explicit Deny should block the request.
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            deny_only,
+            check_deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
-        let info = iam_store
-            .get_user_info(ak)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+        let info = iam_store.get_user_info(ak).await.map_err(iam_error_to_s3_error)?;
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal user err {e}")))?;
@@ -408,6 +592,7 @@ const ALL_SVC_ACCTS_FILE: &str = "svcaccts.json";
 const USER_POLICY_MAPPINGS_FILE: &str = "user_mappings.json";
 const GROUP_POLICY_MAPPINGS_FILE: &str = "group_mappings.json";
 const STS_USER_POLICY_MAPPINGS_FILE: &str = "stsuser_mappings.json";
+const GROUP_POLICY_MAPPING_USER_TYPE: UserType = UserType::Reg;
 
 const IAM_ASSETS_DIR: &str = "iam-assets";
 
@@ -438,7 +623,7 @@ impl Operation for ExportIam {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ExportIAMAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -592,7 +777,7 @@ impl Operation for ExportIam {
                 GROUP_POLICY_MAPPINGS_FILE => {
                     let mut group_policy_mappings = HashMap::new();
                     iam_store
-                        .load_mapped_policies(UserType::Reg, true, &mut group_policy_mappings)
+                        .load_mapped_policies(GROUP_POLICY_MAPPING_USER_TYPE, true, &mut group_policy_mappings)
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
@@ -651,8 +836,8 @@ impl Operation for ImportIam {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            vec![Action::AdminAction(AdminAction::ImportIAMAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -777,10 +962,10 @@ impl Operation for ImportIam {
                 let groups: HashMap<String, GroupInfo> = serde_json::from_slice(&file_content)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                 for (group_name, group_info) in groups {
-                    if let Err(e) = iam_store.get_group_description(&group_name).await {
-                        if matches!(e, rustfs_iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name) {
-                            return Err(s3_error!(InvalidArgument, "group not found or has space be"));
-                        }
+                    if let Err(e) = iam_store.get_group_description(&group_name).await
+                        && should_reject_group_import_name(&group_name, &e)
+                    {
+                        return Err(s3_error!(InvalidArgument, "group not found or has space be"));
                     }
 
                     if let Err(e) = iam_store.add_users_to_group(&group_name, group_info.members.clone()).await {
@@ -789,6 +974,14 @@ impl Operation for ImportIam {
                             error: e.to_string(),
                         });
                     } else {
+                        if should_restore_group_as_disabled(&group_info.status) {
+                            iam_store.set_group_status(&group_name, false).await.map_err(|e| {
+                                S3Error::with_message(
+                                    S3ErrorCode::InternalError,
+                                    format!("set group status failed, name: {group_name}, err: {e}"),
+                                )
+                            })?;
+                        }
                         added.groups.push(group_name.clone());
                     }
                 }
@@ -829,9 +1022,19 @@ impl Operation for ImportIam {
                         return Err(s3_error!(InvalidArgument, "has space be {ak}"));
                     }
 
+                    if let Some(err) = imported_service_account_access_key_failure(&ak, &req.access_key) {
+                        failed.service_accounts.push(err);
+                        continue;
+                    }
+
+                    if let Some(err) = imported_service_account_parent_scope_failure(&ak, &req.parent, &cred, owner) {
+                        failed.service_accounts.push(err);
+                        continue;
+                    }
+
                     let mut update = true;
 
-                    if let Err(e) = iam_store.get_service_account(&req.access_key).await {
+                    if let Err(e) = iam_store.get_service_account(&ak).await {
                         if !matches!(e, rustfs_iam::error::Error::NoSuchServiceAccount(_)) {
                             return Err(s3_error!(InvalidArgument, "failed to get service account {ak} {e}"));
                         }
@@ -839,7 +1042,7 @@ impl Operation for ImportIam {
                     }
 
                     if update {
-                        iam_store.delete_service_account(&req.access_key, true).await.map_err(|e| {
+                        iam_store.delete_service_account(&ak, true).await.map_err(|e| {
                             S3Error::with_message(
                                 S3ErrorCode::InternalError,
                                 format!("failed to delete service account {ak} {e}"),
@@ -866,6 +1069,29 @@ impl Operation for ImportIam {
                             error: e.to_string(),
                         });
                     } else {
+                        if let Some(status) = imported_service_account_status(&req.status)
+                            && status == rustfs_policy::auth::ACCOUNT_OFF
+                        {
+                            iam_store
+                                .update_service_account(
+                                    &ak,
+                                    UpdateServiceAccountOpts {
+                                        session_policy: None,
+                                        secret_key: None,
+                                        name: None,
+                                        description: None,
+                                        expiration: None,
+                                        status: Some(status),
+                                    },
+                                )
+                                .await
+                                .map_err(|e| {
+                                    S3Error::with_message(
+                                        S3ErrorCode::InternalError,
+                                        format!("update service account status failed, name: {ak}, err: {e}"),
+                                    )
+                                })?;
+                        }
                         added.service_accounts.push(ak.clone());
                     }
                 }
@@ -946,7 +1172,7 @@ impl Operation for ImportIam {
                     }
 
                     if let Err(e) = iam_store
-                        .policy_db_set(&group_name, UserType::None, true, &policies.policies)
+                        .policy_db_set(&group_name, GROUP_POLICY_MAPPING_USER_TYPE, true, &policies.policies)
                         .await
                     {
                         failed.group_policies.push(IAMErrPolicyEntity {
@@ -1032,5 +1258,274 @@ impl Operation for ImportIam {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GROUP_POLICY_MAPPING_USER_TYPE, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR,
+        imported_service_account_access_key_failure, imported_service_account_parent_allowed,
+        imported_service_account_parent_scope_failure, imported_service_account_status, should_check_deny_only,
+        should_reject_group_import_name, should_restore_group_as_disabled,
+    };
+    use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
+    use rustfs_iam::error::Error as IamError;
+    use rustfs_madmin::user::SRSvcAccCreate;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_should_check_deny_only_for_regular_self_request() {
+        let cred = Credentials {
+            access_key: "alice".to_string(),
+            ..Default::default()
+        };
+        assert!(should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_should_not_check_deny_only_for_other_user_request() {
+        let cred = Credentials {
+            access_key: "bob".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_should_not_check_deny_only_for_temp_without_parent() {
+        // Session token present but no parent_user — not a well-formed self session for deny_only.
+        let cred = Credentials {
+            access_key: "alice".to_string(),
+            session_token: "temp-token".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_should_check_deny_only_for_temp_when_target_matches_parent_user() {
+        // Console/AssumeRole: signing AK is a session key; IAM user is parent_user.
+        let cred = Credentials {
+            access_key: "VV0V3VYJK2PV6EG45X2Y".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            parent_user: "1923".to_string(),
+            ..Default::default()
+        };
+        assert!(should_check_deny_only("1923", &cred));
+        assert!(!should_check_deny_only("1924", &cred));
+        assert!(!should_check_deny_only("VV0V3VYJK2PV6EG45X2Y", &cred));
+    }
+
+    #[test]
+    fn test_should_check_deny_only_for_temp_when_parent_only_in_jwt_claims() {
+        // STS identity may omit `parentUser` on disk; `check_key_valid` still fills `claims["parent"]`.
+        let mut claims = HashMap::new();
+        claims.insert("parent".to_string(), Value::String("1923".to_string()));
+        let cred = Credentials {
+            access_key: "39KNO04Z34D6T4AGL6E6".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+        assert!(should_check_deny_only("1923", &cred));
+        assert!(!should_check_deny_only("1924", &cred));
+    }
+
+    #[test]
+    fn test_should_not_check_deny_only_for_service_account_credentials() {
+        let mut claims = HashMap::new();
+        claims.insert(IAM_POLICY_CLAIM_NAME_SA.to_string(), Value::String("policy".to_string()));
+        let cred = Credentials {
+            access_key: "alice".to_string(),
+            parent_user: "parent-user".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+        assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_should_not_check_deny_only_when_parent_user_present() {
+        let cred = Credentials {
+            access_key: "alice".to_string(),
+            parent_user: "parent-user".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_group_import_allows_missing_group_without_spaces() {
+        assert!(!should_reject_group_import_name(
+            "new-group",
+            &IamError::NoSuchGroup("new-group".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_group_import_rejects_group_names_with_spaces() {
+        assert!(should_reject_group_import_name(
+            " bad-group",
+            &IamError::NoSuchGroup(" bad-group".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_group_import_restores_disabled_status_only_when_needed() {
+        assert!(should_restore_group_as_disabled("disabled"));
+        assert!(!should_restore_group_as_disabled("enabled"));
+    }
+
+    #[test]
+    fn test_imported_service_account_status_maps_on_and_off() {
+        assert_eq!(imported_service_account_status("off").as_deref(), Some("off"));
+        assert_eq!(imported_service_account_status("on").as_deref(), Some("on"));
+        assert_eq!(imported_service_account_status("disabled").as_deref(), Some("off"));
+        assert_eq!(imported_service_account_status("enabled").as_deref(), Some("on"));
+        assert!(imported_service_account_status("unknown").is_none());
+    }
+
+    #[test]
+    fn test_import_service_account_parent_rejects_other_parent_for_non_owner() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!imported_service_account_parent_allowed("root-access-key", &requester, false));
+    }
+
+    #[test]
+    fn test_service_account_parent_scope_failure_records_import_error() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+        let err = imported_service_account_parent_scope_failure("svc-access-key", "root-access-key", &requester, false)
+            .expect("non-owner must not import a service account for another parent");
+
+        assert_eq!(err.name, "svc-access-key");
+        assert_eq!(err.error, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR);
+        assert!(
+            imported_service_account_parent_scope_failure("svc-access-key", "delegated-importer", &requester, false).is_none()
+        );
+    }
+
+    #[test]
+    fn test_service_account_import_rejects_payload_access_key_mismatch() {
+        let payload = r#"{
+            "svcalpha": {
+                "parent": "useralpha",
+                "accessKey": "svcbeta",
+                "secretKey": "svcAlphaSecret123",
+                "groups": [],
+                "claims": {},
+                "sessionPolicy": null,
+                "status": "on",
+                "name": "uploaderKey",
+                "description": "alpha upload key",
+                "expiration": "1970-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_str(payload).unwrap();
+        let req = svc_accts.get("svcalpha").unwrap();
+        let err = imported_service_account_access_key_failure("svcalpha", &req.access_key)
+            .expect("mismatched service account access keys must be rejected");
+
+        assert_eq!(err.name, "svcalpha");
+        assert_eq!(err.error, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR);
+        assert!(imported_service_account_access_key_failure("svcalpha", "svcalpha").is_none());
+    }
+
+    #[test]
+    fn test_import_service_account_parent_allows_owner_restore() {
+        let requester = Credentials {
+            access_key: "root-access-key".to_string(),
+            ..Default::default()
+        };
+
+        assert!(imported_service_account_parent_allowed("any-imported-parent", &requester, true));
+    }
+
+    #[test]
+    fn test_import_service_account_parent_allows_requester_self_parent() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+
+        assert!(imported_service_account_parent_allowed("delegated-importer", &requester, false));
+    }
+
+    #[test]
+    fn test_import_service_account_parent_allows_derived_requester_parent() {
+        let requester = Credentials {
+            access_key: "derived-access-key".to_string(),
+            parent_user: "parent-user".to_string(),
+            session_token: "session-token".to_string(),
+            ..Default::default()
+        };
+
+        assert!(imported_service_account_parent_allowed("parent-user", &requester, false));
+        assert!(!imported_service_account_parent_allowed("other-parent", &requester, false));
+    }
+
+    #[test]
+    fn test_service_account_import_accepts_null_groups_and_epoch_expiration() {
+        let payload = r#"{
+            "svcalpha": {
+                "parent": "useralpha",
+                "accessKey": "svcalpha",
+                "secretKey": "svcAlphaSecret123",
+                "groups": null,
+                "claims": {
+                    "accessKey": "svcalpha",
+                    "parent": "useralpha",
+                    "sa-policy": "inherited-policy"
+                },
+                "sessionPolicy": null,
+                "status": "on",
+                "name": "uploaderKey",
+                "description": "alpha upload key",
+                "expiration": "1970-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_str(payload).unwrap();
+        let svc = svc_accts.get("svcalpha").unwrap();
+
+        assert!(svc.groups.is_empty());
+        assert!(svc.expiration.is_none());
+    }
+
+    #[test]
+    fn test_service_account_import_preserves_non_zero_expiration() {
+        let payload = r#"{
+            "svcalpha": {
+                "parent": "useralpha",
+                "accessKey": "svcalpha",
+                "secretKey": "svcAlphaSecret123",
+                "groups": [],
+                "claims": {},
+                "sessionPolicy": null,
+                "status": "on",
+                "name": "uploaderKey",
+                "description": "alpha upload key",
+                "expiration": "2030-01-02T03:04:05Z"
+            }
+        }"#;
+
+        let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_str(payload).unwrap();
+        let svc = svc_accts.get("svcalpha").unwrap();
+
+        assert_eq!(svc.expiration.map(|expiration| expiration.unix_timestamp()), Some(1893553445));
+    }
+
+    #[test]
+    fn test_group_policy_mappings_use_regular_user_type() {
+        assert_eq!(GROUP_POLICY_MAPPING_USER_TYPE, rustfs_iam::store::UserType::Reg);
     }
 }

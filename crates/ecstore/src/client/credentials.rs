@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,13 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use quick_xml;
+use serde::de::Deserialize;
 use std::fmt::{Display, Formatter};
+use std::io::{Error, ErrorKind};
 
 use time::OffsetDateTime;
 
@@ -54,7 +57,9 @@ impl<P: Provider + Default> Credentials<P> {
 
     pub fn get_with_context(&mut self, mut cc: Option<CredContext>) -> Result<Value, std::io::Error> {
         if self.is_expired() {
-            let creds = self.provider.retrieve_with_cred_context(cc.expect("err"));
+            let creds = self.provider.retrieve_with_cred_context(cc.unwrap_or(CredContext {
+                endpoint: "".to_string(),
+            }));
             self.creds = creds;
             self.force_refresh = false;
         }
@@ -154,10 +159,21 @@ impl ErrorResponse {
     }
 }
 
-pub fn xml_decoder<T>(body: &[u8]) -> Result<T, std::io::Error> {
-    todo!();
+pub fn xml_decoder<T>(body: &[u8]) -> Result<T, Error>
+where
+    for<'de> T: Deserialize<'de>,
+{
+    match std::str::from_utf8(body) {
+        Ok(xml_body) => quick_xml::de::from_str::<T>(xml_body).map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string())),
+        Err(err) => Err(Error::new(ErrorKind::InvalidData, err.to_string())),
+    }
 }
 
-pub fn xml_decode_and_body<T>(body_reader: &[u8]) -> Result<(Vec<u8>, T), std::io::Error> {
-    todo!();
+pub fn xml_decode_and_body<T>(body_reader: &[u8]) -> Result<(Vec<u8>, T), std::io::Error>
+where
+    for<'de> T: Deserialize<'de>,
+{
+    let body = body_reader.to_vec();
+    let parsed = xml_decoder(&body)?;
+    Ok((body, parsed))
 }

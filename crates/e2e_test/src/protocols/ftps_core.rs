@@ -14,15 +14,18 @@
 
 //! Core FTPS tests
 
-use crate::common::rustfs_binary_path;
+use crate::common::rustfs_binary_path_with_features;
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
-use native_tls::TlsConnector;
 use rcgen::generate_simple_self_signed;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use std::io::Cursor;
 use std::path::PathBuf;
-use suppaftp::NativeTlsConnector;
-use suppaftp::NativeTlsFtpStream;
+use std::sync::Arc;
+use suppaftp::RustlsConnector;
+use suppaftp::RustlsFtpStream;
 use tokio::process::Command;
 use tracing::info;
 
@@ -30,34 +33,79 @@ use tracing::info;
 const FTPS_PORT: u16 = 9021;
 const FTPS_ADDRESS: &str = "127.0.0.1:9021";
 
+#[derive(Debug)]
+struct AcceptAnyServerCertVerifier;
+
+impl ServerCertVerifier for AcceptAnyServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Test FTPS: put, ls, mkdir, rmdir, delete operations
 pub async fn test_ftps_core_operations() -> Result<()> {
     let env = ProtocolTestEnvironment::new().map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Generate and write certificate
-    let cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
-    let cert_path = PathBuf::from(&env.temp_dir).join("ftps.crt");
-    let key_path = PathBuf::from(&env.temp_dir).join("ftps.key");
+    let cert_dir = PathBuf::from(&env.temp_dir).join("ftps_certs");
+    tokio::fs::create_dir_all(&cert_dir).await?;
 
-    let cert_pem = cert.cert.pem();
-    let key_pem = cert.signing_key.serialize_pem();
-    tokio::fs::write(&cert_path, &cert_pem).await?;
-    tokio::fs::write(&key_path, &key_pem).await?;
+    // Generate default certificate for root directory
+    let default_cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
+    let default_cert_path = cert_dir.join("rustfs_cert.pem");
+    let default_key_path = cert_dir.join("rustfs_key.pem");
+    tokio::fs::write(&default_cert_path, default_cert.cert.pem()).await?;
+    tokio::fs::write(&default_key_path, default_cert.signing_key.serialize_pem()).await?;
+
+    // Create subdirectory for domain-specific certificate
+    let example_domain_dir = cert_dir.join("example1.com");
+    tokio::fs::create_dir_all(&example_domain_dir).await?;
+    let domain_cert = generate_simple_self_signed(vec!["example1.com".to_string()])?;
+    let domain_cert_path = example_domain_dir.join("rustfs_cert.pem");
+    let domain_key_path = example_domain_dir.join("rustfs_key.pem");
+    tokio::fs::write(&domain_cert_path, domain_cert.cert.pem()).await?;
+    tokio::fs::write(&domain_key_path, domain_cert.signing_key.serialize_pem()).await?;
+
+    info!("Generated 2 certificates in {:?}", cert_dir);
 
     // Start server manually
     info!("Starting FTPS server on {}", FTPS_ADDRESS);
-    let binary_path = rustfs_binary_path();
+    let binary_path = rustfs_binary_path_with_features(Some("ftps,webdav"));
     let mut server_process = Command::new(&binary_path)
-        .args([
-            "--ftps-enable",
-            "--ftps-address",
-            FTPS_ADDRESS,
-            "--ftps-certs-file",
-            cert_path.to_str().unwrap(),
-            "--ftps-key-file",
-            key_path.to_str().unwrap(),
-            &env.temp_dir,
-        ])
+        .env("RUSTFS_FTPS_ENABLE", "true")
+        .env("RUSTFS_FTPS_ADDRESS", FTPS_ADDRESS)
+        .env("RUSTFS_FTPS_CERTS_DIR", cert_dir.to_str().unwrap())
+        .arg(&env.temp_dir)
         .spawn()?;
 
     // Ensure server is cleaned up even on failure
@@ -67,14 +115,21 @@ pub async fn test_ftps_core_operations() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // Create native TLS connector that accepts the certificate
-        let tls_connector = TlsConnector::builder().danger_accept_invalid_certs(true).build()?;
+        // Build ServerConfig with SNI support
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))?;
 
-        // Wrap in suppaftp's NativeTlsConnector
-        let tls_connector = NativeTlsConnector::from(tls_connector);
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
+            .with_no_client_auth();
+
+        // Wrap in suppaftp's RustlsConnector
+        let tls_connector = RustlsConnector::from(Arc::new(config));
 
         // Connect to FTPS server
-        let ftp_stream = NativeTlsFtpStream::connect(FTPS_ADDRESS).map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
+        let ftp_stream = RustlsFtpStream::connect(FTPS_ADDRESS).map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
 
         // Upgrade to secure connection
         let mut ftp_stream = ftp_stream
@@ -96,6 +151,16 @@ pub async fn test_ftps_core_operations() -> Result<()> {
         let content = "Hello, FTPS!";
         ftp_stream.put_file(filename, &mut Cursor::new(content.as_bytes()))?;
         info!("PASS: put file '{}' ({} bytes) successful", filename, content.len());
+
+        info!("Testing FTPS: download file");
+        let downloaded_content = ftp_stream.retr(filename, |stream| {
+            let mut buffer = Vec::new();
+            stream.read_to_end(&mut buffer).map_err(suppaftp::FtpError::ConnectionError)?;
+            Ok(buffer)
+        })?;
+        let downloaded_str = String::from_utf8(downloaded_content)?;
+        assert_eq!(downloaded_str, content, "Downloaded content should match uploaded content");
+        info!("PASS: download file '{}' successful, content matches", filename);
 
         info!("Testing FTPS: ls list objects in bucket");
         let list = ftp_stream.list(None)?;

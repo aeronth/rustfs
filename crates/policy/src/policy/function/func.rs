@@ -19,7 +19,7 @@ use serde::{
     de::{self, Visitor},
 };
 
-use super::key::Key;
+use super::{key::Key, key_name::KeyName};
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct InnerFunc<T>(pub(crate) Vec<FuncKeyValue<T>>);
@@ -42,6 +42,16 @@ impl<T: Clone> Clone for FuncKeyValue<T> {
 impl<T: Clone> Clone for InnerFunc<T> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+impl<T> InnerFunc<T> {
+    pub fn key_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.0.iter().map(|kv| kv.key.name())
+    }
+
+    pub fn contains_key_name(&self, key_name: &KeyName) -> bool {
+        self.0.iter().any(|kv| kv.key.is(key_name))
     }
 }
 

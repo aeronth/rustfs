@@ -3,6 +3,11 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "rustfs.fullname" . }}-headless
+  namespace: {{ .Release.Namespace }}
+  {{- with (include "rustfs.headlessServiceAnnotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
     {{- with .Values.commonLabels }}
@@ -27,13 +32,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "rustfs.fullname" . }}-svc
-  {{- if .Values.mode.distributed.enabled }}
-  {{- if eq .Values.ingress.className "traefik" }}
-  {{- with .Values.ingress.traefikAnnotations }}
+  namespace: {{ .Release.Namespace }}
+  {{- with (include "rustfs.serviceAnnotations" .) }}
   annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- end }}
+    {{- . | nindent 4 }}
   {{- end }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
@@ -49,6 +51,18 @@ spec:
   sessionAffinityConfig:
     clientIP:
       timeoutSeconds: 10800
+  {{- else if eq $serviceType "LoadBalancer" }}
+  type: LoadBalancer
+  {{- with .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
   ports:
     - name: endpoint

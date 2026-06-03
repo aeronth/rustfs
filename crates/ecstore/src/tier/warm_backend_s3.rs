@@ -34,7 +34,7 @@ use crate::error::ErrorResponse;
 use crate::error::error_resp_to_object_err;
 use crate::tier::{
     tier_config::TierS3,
-    warm_backend::{WarmBackend, WarmBackendGetOpts},
+    warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
 };
 use rustfs_utils::path::SLASH_SEPARATOR;
 
@@ -95,7 +95,10 @@ impl WarmBackendS3 {
             region: conf.region.clone(),
             ..Default::default()
         };
-        let client = TransitionClient::new(&u.host().expect("err").to_string(), opts, "s3").await?;
+        let host = u
+            .host()
+            .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+        let client = TransitionClient::new(&host.to_string(), opts, "s3").await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
@@ -128,18 +131,11 @@ impl WarmBackend for WarmBackendS3 {
     ) -> Result<String, std::io::Error> {
         let client = self.client.clone();
         let res = client
-            .put_object(
-                &self.bucket,
-                &self.get_dest(object),
-                r,
-                length,
-                &PutObjectOptions {
-                    send_content_md5: true,
-                    storage_class: self.storage_class.clone(),
-                    user_metadata: meta,
-                    ..Default::default()
-                },
-            )
+            .put_object(&self.bucket, &self.get_dest(object), r, length, &{
+                let mut opts = build_transition_put_options(self.storage_class.clone(), meta);
+                opts.send_content_md5 = true;
+                opts
+            })
             .await?;
         Ok(res.version_id)
     }
@@ -171,8 +167,10 @@ impl WarmBackend for WarmBackendS3 {
             ropts.version_id = rv.to_string();
         }
         let client = self.client.clone();
-        let err = client.remove_object(&self.bucket, &self.get_dest(object), ropts).await;
-        Err(std::io::Error::other(err.expect("err")))
+        match client.remove_object(&self.bucket, &self.get_dest(object), ropts).await {
+            None => Ok(()),
+            Some(err) => Err(std::io::Error::other(err)),
+        }
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {

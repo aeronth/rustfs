@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_ecstore::bucket::quota::QuotaError;
 use rustfs_ecstore::error::StorageError;
 use s3s::{S3Error, S3ErrorCode};
 
@@ -180,6 +181,31 @@ impl ApiError {
     }
 }
 
+fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
+where
+    T: std::error::Error + 'static,
+{
+    if err.downcast_ref::<T>().is_some() {
+        return true;
+    }
+
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+        && let Some(inner) = io_err.get_ref()
+        && error_chain_has_type::<T>(inner)
+    {
+        return true;
+    }
+
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if err.downcast_ref::<T>().is_some() {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
         let mut s3e = S3Error::with_message(err.code, err.message);
@@ -193,18 +219,16 @@ impl From<ApiError> for S3Error {
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
         // Special handling for Io errors that may contain ChecksumMismatch
-        if let StorageError::Io(ref io_err) = err {
-            if let Some(inner) = io_err.get_ref() {
-                if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some()
-                    || inner.downcast_ref::<rustfs_rio::BadDigest>().is_some()
-                {
-                    return ApiError {
-                        code: S3ErrorCode::BadDigest,
-                        message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
-                        source: Some(Box::new(err)),
-                    };
-                }
-            }
+        if let StorageError::Io(ref io_err) = err
+            && let Some(inner) = io_err.get_ref()
+            && (inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some()
+                || inner.downcast_ref::<rustfs_rio::BadDigest>().is_some())
+        {
+            return ApiError {
+                code: S3ErrorCode::BadDigest,
+                message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                source: Some(Box::new(err)),
+            };
         }
 
         let code = match &err {
@@ -218,8 +242,13 @@ impl From<StorageError> for ApiError {
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
+            StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
+            StorageError::DecommissionNotStarted => S3ErrorCode::InvalidRequest,
+            StorageError::DecommissionAlreadyRunning => S3ErrorCode::InvalidRequest,
+            StorageError::RebalanceAlreadyRunning => S3ErrorCode::InvalidRequest,
             StorageError::PrefixAccessDenied(_, _) => S3ErrorCode::AccessDenied,
             StorageError::InvalidUploadIDKeyCombination(_, _) => S3ErrorCode::InvalidArgument,
+            StorageError::MalformedUploadID(_) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectNameTooLong(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectNamePrefixAsSlash(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectNotFound(_, _) => S3ErrorCode::NoSuchKey,
@@ -228,7 +257,7 @@ impl From<StorageError> for ApiError {
             StorageError::FileNotFound => S3ErrorCode::NoSuchKey,
             StorageError::FileVersionNotFound => S3ErrorCode::NoSuchVersion,
             StorageError::VersionNotFound(_, _, _) => S3ErrorCode::NoSuchVersion,
-            StorageError::InvalidUploadID(_, _, _) => S3ErrorCode::InvalidPart,
+            StorageError::InvalidUploadID(_, _, _) => S3ErrorCode::NoSuchUpload,
             StorageError::InvalidVersionID(_, _, _) => S3ErrorCode::InvalidArgument,
             StorageError::DataMovementOverwriteErr(_, _, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectExistsAsDirectory(_, _) => S3ErrorCode::InvalidArgument,
@@ -256,17 +285,18 @@ impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
         // Check if the error is a ChecksumMismatch (BadDigest)
         if let Some(inner) = err.get_ref() {
-            if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some() {
+            if error_chain_has_type::<rustfs_rio::ChecksumMismatch>(inner) || error_chain_has_type::<rustfs_rio::BadDigest>(inner)
+            {
                 return ApiError {
                     code: S3ErrorCode::BadDigest,
                     message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
                     source: Some(Box::new(err)),
                 };
             }
-            if inner.downcast_ref::<rustfs_rio::BadDigest>().is_some() {
+            if error_chain_has_type::<rustfs_rio::IncompleteBody>(inner) {
                 return ApiError {
-                    code: S3ErrorCode::BadDigest,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                    code: S3ErrorCode::IncompleteBody,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
                     source: Some(Box::new(err)),
                 };
             }
@@ -283,6 +313,29 @@ impl From<rustfs_iam::error::Error> for ApiError {
     fn from(err: rustfs_iam::error::Error) -> Self {
         let serr: StorageError = err.into();
         serr.into()
+    }
+}
+
+impl From<QuotaError> for ApiError {
+    fn from(err: QuotaError) -> Self {
+        let code = match &err {
+            QuotaError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
+            QuotaError::ConfigNotFound { .. } => S3ErrorCode::NoSuchBucket,
+            QuotaError::InvalidConfig { .. } => S3ErrorCode::InvalidArgument,
+            QuotaError::StorageError(_) => S3ErrorCode::InternalError,
+        };
+
+        let message = if code == S3ErrorCode::InternalError {
+            err.to_string()
+        } else {
+            ApiError::error_code_to_message(&code)
+        };
+
+        ApiError {
+            code,
+            message,
+            source: Some(Box::new(err)),
+        }
     }
 }
 
@@ -387,12 +440,30 @@ mod tests {
             (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
+            (
+                StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "write",
+                    bucket: "bucket".into(),
+                    object: "object".into(),
+                    required: 3,
+                    achieved: 2,
+                },
+                S3ErrorCode::ServiceUnavailable,
+            ),
+            (StorageError::DecommissionNotStarted, S3ErrorCode::InvalidRequest),
+            (StorageError::DecommissionAlreadyRunning, S3ErrorCode::InvalidRequest),
+            (StorageError::RebalanceAlreadyRunning, S3ErrorCode::InvalidRequest),
             (StorageError::PrefixAccessDenied("test".into(), "test".into()), S3ErrorCode::AccessDenied),
             (StorageError::ObjectNotFound("test".into(), "test".into()), S3ErrorCode::NoSuchKey),
             (StorageError::ConfigNotFound, S3ErrorCode::NoSuchKey),
             (StorageError::VolumeNotFound, S3ErrorCode::NoSuchBucket),
             (StorageError::FileNotFound, S3ErrorCode::NoSuchKey),
             (StorageError::FileVersionNotFound, S3ErrorCode::NoSuchVersion),
+            (StorageError::MalformedUploadID("test".into()), S3ErrorCode::InvalidArgument),
+            (
+                StorageError::InvalidUploadID("bucket".into(), "object".into(), "uploadid".into()),
+                S3ErrorCode::NoSuchUpload,
+            ),
         ];
 
         for (storage_error, expected_code) in test_cases {
@@ -400,6 +471,29 @@ mod tests {
             assert_eq!(api_error.code, expected_code);
             assert!(api_error.source.is_some());
         }
+    }
+
+    #[test]
+    fn test_api_error_from_unexpected_eof_maps_to_incomplete_body() {
+        let io_error = IoError::new(ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining: 7 });
+        let api_error: ApiError = io_error.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+        assert!(api_error.source.is_some());
+    }
+
+    #[test]
+    fn test_api_error_from_nested_unexpected_eof_maps_to_incomplete_body() {
+        let nested = IoError::new(
+            ErrorKind::UnexpectedEof,
+            IoError::new(ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining: 7 }),
+        );
+        let api_error: ApiError = nested.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+        assert!(api_error.source.is_some());
     }
 
     #[test]
@@ -424,6 +518,23 @@ mod tests {
         assert_eq!(*s3_error.code(), S3ErrorCode::NoSuchBucket);
         assert!(s3_error.message().unwrap_or("").contains("Bucket not found"));
         assert!(s3_error.source().is_some());
+    }
+
+    #[test]
+    fn test_namespace_lock_quorum_failure_maps_to_service_unavailable_status() {
+        let api_error: ApiError = StorageError::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: "bucket".into(),
+            object: "object".into(),
+            required: 3,
+            achieved: 2,
+        }
+        .into();
+
+        let s3_error: S3Error = api_error.into();
+
+        assert_eq!(*s3_error.code(), S3ErrorCode::ServiceUnavailable);
+        assert_eq!(s3_error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
     }
 
     #[test]

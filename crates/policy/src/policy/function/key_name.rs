@@ -79,6 +79,7 @@ impl KeyName {
         KeyName::Jwt(JwtKeyName::JWTName),
         KeyName::Jwt(JwtKeyName::JWTUpn),
         KeyName::Jwt(JwtKeyName::JWTGroups),
+        KeyName::Jwt(JwtKeyName::JWTRoles),
         KeyName::Jwt(JwtKeyName::JWTGivenName),
         KeyName::Jwt(JwtKeyName::JWTFamilyName),
         KeyName::Jwt(JwtKeyName::JWTMiddleName),
@@ -160,6 +161,9 @@ pub enum S3KeyName {
     #[strum(serialize = "s3:x-amz-content-sha256")]
     S3XAmzContentSha256,
 
+    #[strum(serialize = "s3:x-amz-acl")]
+    S3XAmzAcl,
+
     #[strum(serialize = "s3:LocationConstraint")]
     S3LocationConstraint,
 
@@ -180,6 +184,21 @@ pub enum S3KeyName {
 
     #[strum(serialize = "s3:delimiter")]
     S3Delimiter,
+
+    #[strum(serialize = "s3:x-amz-grant-full-control")]
+    S3XAmzGrantFullControl,
+
+    #[strum(serialize = "s3:x-amz-grant-read")]
+    S3XAmzGrantRead,
+
+    #[strum(serialize = "s3:x-amz-grant-write")]
+    S3XAmzGrantWrite,
+
+    #[strum(serialize = "s3:x-amz-grant-read-acp")]
+    S3XAmzGrantReadAcp,
+
+    #[strum(serialize = "s3:x-amz-grant-write-acp")]
+    S3XAmzGrantWriteAcp,
 
     #[strum(serialize = "s3:ExistingObjectTag")]
     S3ExistingObjectTag,
@@ -212,6 +231,9 @@ pub enum JwtKeyName {
 
     #[strum(serialize = "jwt:groups")]
     JWTGroups,
+
+    #[strum(serialize = "jwt:roles")]
+    JWTRoles,
 
     #[strum(serialize = "jwt:given_name")]
     JWTGivenName,
@@ -318,6 +340,12 @@ pub enum AwsKeyName {
 
     #[strum(serialize = "aws:groups")]
     AWSGroups,
+
+    #[strum(serialize = "aws:SourceArn")]
+    AWSSourceArn,
+
+    #[strum(serialize = "aws:SourceAccount")]
+    AWSSourceAccount,
 }
 
 #[cfg(test)]
@@ -378,5 +406,10 @@ mod tests {
         let except = format!("{{\"data\":\"{except}\"}}");
         let data = serde_json::to_string(&TestCase { data: value }).expect("marshal failed");
         assert_eq!(data, except);
+    }
+
+    #[test]
+    fn key_name_from_str_supports_jwt_roles() {
+        assert!(KeyName::try_from("jwt:roles").is_ok());
     }
 }

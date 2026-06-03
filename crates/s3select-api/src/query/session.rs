@@ -15,11 +15,16 @@
 use crate::query::Context;
 use crate::{QueryError, QueryResult, object_store::EcObjectStore};
 use datafusion::{
+    arrow::{
+        array::{Int32Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    },
     execution::{SessionStateBuilder, context::SessionState, runtime_env::RuntimeEnvBuilder},
-    parquet::data_type::AsBytes,
+    parquet::arrow::ArrowWriter,
     prelude::SessionContext,
 };
-use object_store::{ObjectStore, memory::InMemory, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use std::sync::Arc;
 use tracing::error;
 
@@ -65,30 +70,40 @@ impl SessionCtxFactory {
 
         let df_session_state = if self.is_test {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let data = b"id,name,age,department,salary
-            1,Alice,25,HR,5000
-            2,Bob,30,IT,6000
-            3,Charlie,35,Finance,7000
-            4,Diana,22,Marketing,4500
-            5,Eve,28,IT,5500
-            6,Frank,40,Finance,8000
-            7,Grace,26,HR,5200
-            8,Henry,32,IT,6200
-            9,Ivy,24,Marketing,4800
-            10,Jack,38,Finance,7500";
-            let data_bytes = data.as_bytes();
-            // let data = r#""year"╦"gender"╦"ethnicity"╦"firstname"╦"count"╦"rank"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"SOPHIA"╦"119"╦"1"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"CHLOE"╦"106"╦"2"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"EMILY"╦"93"╦"3"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"OLIVIA"╦"89"╦"4"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"EMMA"╦"75"╦"5"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"ISABELLA"╦"67"╦"6"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"TIFFANY"╦"54"╦"7"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"ASHLEY"╦"52"╦"8"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"FIONA"╦"48"╦"9"
-            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"ANGELA"╦"47"╦"10""#;
-            // let data_bytes = Bytes::from(data);
+
+            // Choose test data format based on what the request serialization specifies.
+            let data_bytes: Vec<u8> = if context.input.request.input_serialization.parquet.is_some() {
+                test_parquet_bytes()?
+            } else if context.input.request.input_serialization.json.is_some() {
+                // NDJSON: one JSON object per line — usable for both LINES and DOCUMENT
+                // requests (DOCUMENT inputs are converted to NDJSON by EcObjectStore, but
+                // in test mode we bypass EcObjectStore, so we put NDJSON here directly).
+                b"{\"id\":1,\"name\":\"Alice\",\"age\":25,\"department\":\"HR\",\"salary\":5000}\n\
+                   {\"id\":2,\"name\":\"Bob\",\"age\":30,\"department\":\"IT\",\"salary\":6000}\n\
+                   {\"id\":3,\"name\":\"Charlie\",\"age\":35,\"department\":\"Finance\",\"salary\":7000}\n\
+                   {\"id\":4,\"name\":\"Diana\",\"age\":22,\"department\":\"Marketing\",\"salary\":4500}\n\
+                   {\"id\":5,\"name\":\"Eve\",\"age\":28,\"department\":\"IT\",\"salary\":5500}\n\
+                   {\"id\":6,\"name\":\"Frank\",\"age\":40,\"department\":\"Finance\",\"salary\":8000}\n\
+                   {\"id\":7,\"name\":\"Grace\",\"age\":26,\"department\":\"HR\",\"salary\":5200}\n\
+                   {\"id\":8,\"name\":\"Henry\",\"age\":32,\"department\":\"IT\",\"salary\":6200}\n\
+                   {\"id\":9,\"name\":\"Ivy\",\"age\":24,\"department\":\"Marketing\",\"salary\":4800}\n\
+                   {\"id\":10,\"name\":\"Jack\",\"age\":38,\"department\":\"Finance\",\"salary\":7500}\n"
+                    .to_vec()
+            } else {
+                b"id,name,age,department,salary
+                1,Alice,25,HR,5000
+                2,Bob,30,IT,6000
+                3,Charlie,35,Finance,7000
+                4,Diana,22,Marketing,4500
+                5,Eve,28,IT,5500
+                6,Frank,40,Finance,8000
+                7,Grace,26,HR,5200
+                8,Henry,32,IT,6200
+                9,Ivy,24,Marketing,4800
+                10,Jack,38,Finance,7500"
+                    .to_vec()
+            };
+
             let path = Path::from(context.input.key.clone());
             store.put(&path, data_bytes.into()).await.map_err(|e| {
                 error!("put data into memory failed: {}", e.to_string());
@@ -97,7 +112,7 @@ impl SessionCtxFactory {
 
             df_session_state.with_object_store(&store_url, Arc::new(store)).build()
         } else {
-            let store =
+            let store: EcObjectStore =
                 EcObjectStore::new(context.input.clone()).map_err(|_| QueryError::NotImplemented { err: String::new() })?;
             df_session_state.with_object_store(&store_url, Arc::new(store)).build()
         };
@@ -106,4 +121,60 @@ impl SessionCtxFactory {
 
         Ok(df_session_ctx)
     }
+}
+
+fn test_parquet_bytes() -> QueryResult<Vec<u8>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+        Field::new("department", DataType::Utf8, false),
+        Field::new("salary", DataType::Int32, false),
+    ]));
+    let first_batch =
+        test_parquet_batch(Arc::clone(&schema), &[1, 2], &["Alice", "Bob"], &[25, 30], &["HR", "IT"], &[5000, 6000])?;
+    let second_batch = test_parquet_batch(
+        Arc::clone(&schema),
+        &[3, 4, 5],
+        &["Charlie", "Diana", "Eve"],
+        &[35, 22, 28],
+        &["Finance", "Marketing", "IT"],
+        &[7000, 4500, 5500],
+    )?;
+
+    let mut bytes = Vec::new();
+    {
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, schema, None).map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer
+            .write(&first_batch)
+            .map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer.flush().map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer
+            .write(&second_batch)
+            .map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer.close().map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+    }
+    Ok(bytes)
+}
+
+fn test_parquet_batch(
+    schema: Arc<Schema>,
+    ids: &[i32],
+    names: &[&str],
+    ages: &[i32],
+    departments: &[&str],
+    salaries: &[i32],
+) -> QueryResult<RecordBatch> {
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(names.to_vec())),
+            Arc::new(Int32Array::from(ages.to_vec())),
+            Arc::new(StringArray::from(departments.to_vec())),
+            Arc::new(Int32Array::from(salaries.to_vec())),
+        ],
+    )
+    .map_err(|e| QueryError::StoreError { e: e.to_string() })
 }

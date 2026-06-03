@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::policy::function::condition::Condition;
+use crate::policy::function::{condition::Condition, key_name::KeyName};
 use crate::policy::variables::PolicyVariableResolver;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer, de};
@@ -71,6 +71,14 @@ impl Functions {
     pub fn is_empty(&self) -> bool {
         self.for_all_values.is_empty() && self.for_any_value.is_empty() && self.for_normal.is_empty()
     }
+
+    pub fn references_key_name(&self, key_name: &KeyName) -> bool {
+        self.for_any_value
+            .iter()
+            .chain(self.for_all_values.iter())
+            .chain(self.for_normal.iter())
+            .any(|condition| condition.references_key_name(key_name))
+    }
 }
 
 impl Serialize for Functions {
@@ -82,17 +90,17 @@ impl Serialize for Functions {
             serializer.serialize_map(Some(self.for_any_value.len() + self.for_all_values.len() + self.for_normal.len()))?;
 
         for conditions in self.for_all_values.iter() {
-            se.serialize_key(format!("ForAllValues:{}", conditions.to_key()).as_str())?;
+            se.serialize_key(&format!("ForAllValues:{}", conditions.to_key_with_suffix()))?;
             conditions.serialize_map(&mut se)?;
         }
 
         for conditions in self.for_any_value.iter() {
-            se.serialize_key(format!("ForAnyValue:{}", conditions.to_key()).as_str())?;
+            se.serialize_key(&format!("ForAnyValue:{}", conditions.to_key_with_suffix()))?;
             conditions.serialize_map(&mut se)?;
         }
 
         for conditions in self.for_normal.iter() {
-            se.serialize_key(conditions.to_key())?;
+            se.serialize_key(&conditions.to_key_with_suffix())?;
             conditions.serialize_map(&mut se)?;
         }
 
@@ -354,6 +362,34 @@ mod tests {
             }
         }"# => true;
         "6"
+    )]
+    #[test_case(
+        r#"{
+            "NumericLessThanEquals": {
+                "s3:max-keys": "10"
+            }
+        }"# => true; "numeric_less_than_equals"
+    )]
+    #[test_case(
+        r#"{
+            "DateLessThan": {
+                "aws:CurrentTime": "2026-01-01T00:00:00Z"
+            }
+        }"# => true; "date_less_than"
+    )]
+    #[test_case(
+        r#"{
+            "StringLikeIfExists": {
+                "aws:Referer": "http://www.example.com/*"
+            }
+        }"# => true; "string_like_if_exists"
+    )]
+    #[test_case(
+        r#"{
+            "ArnLike": {
+                "aws:SourceArn": "arn:aws:s3:::my-bucket"
+            }
+        }"# => true; "arn_like"
     )]
     fn test_de(input: &str) -> bool {
         serde_json::from_str::<Functions>(input)

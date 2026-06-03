@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::ReplicationRuleExt as _;
+use crate::bucket::replication::ReplicationRuleExt as _;
 use crate::bucket::tagging::decode_tags_to_map;
 use rustfs_filemeta::ReplicationType;
 use s3s::dto::DeleteMarkerReplicationStatus;
@@ -55,10 +55,10 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 if !has_arn {
                     has_arn = true;
                 }
-                if let Some(status) = &rule.existing_object_replication {
-                    if status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED) {
-                        return (true, true);
-                    }
+                if let Some(status) = &rule.existing_object_replication
+                    && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED)
+                {
+                    return (true, true);
                 }
             }
         }
@@ -86,12 +86,11 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if let Some(status) = &rule.existing_object_replication {
-                if obj.existing_object
-                    && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
-                {
-                    continue;
-                }
+            if let Some(status) = &rule.existing_object_replication
+                && obj.existing_object
+                && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+            {
+                continue;
             }
 
             if !obj.name.starts_with(rule.prefix()) {
@@ -145,16 +144,24 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if let Some(status) = &rule.existing_object_replication {
-                if obj.existing_object
-                    && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
-                {
-                    return false;
-                }
+            if let Some(status) = &rule.existing_object_replication
+                && obj.existing_object
+                && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+            {
+                return false;
             }
 
             if obj.op_type == ReplicationType::Delete {
+                if !rule.metadata_replicate(obj) {
+                    return false;
+                }
+
                 if obj.version_id.is_some() {
+                    if obj.delete_marker {
+                        return rule.delete_marker_replication.clone().is_some_and(|d| {
+                            d.status == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
+                        });
+                    }
                     return rule
                         .delete_replication
                         .clone()
@@ -186,19 +193,19 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if let Some(filter) = &rule.filter {
-                if let Some(filter_prefix) = &filter.prefix {
-                    if !prefix.is_empty() && !filter_prefix.is_empty() {
-                        // The provided prefix must fall within the rule prefix
-                        if !recursive && !prefix.starts_with(filter_prefix) {
-                            continue;
-                        }
-                    }
-
-                    // When recursive, skip this rule if it does not match the test prefix or hierarchy
-                    if recursive && !rule.prefix().starts_with(prefix) && !prefix.starts_with(rule.prefix()) {
+            if let Some(filter) = &rule.filter
+                && let Some(filter_prefix) = &filter.prefix
+            {
+                if !prefix.is_empty() && !filter_prefix.is_empty() {
+                    // The provided prefix must fall within the rule prefix
+                    if !recursive && !prefix.starts_with(filter_prefix) {
                         continue;
                     }
+                }
+
+                // When recursive, skip this rule if it does not match the test prefix or hierarchy
+                if recursive && !rule.prefix().starts_with(prefix) && !prefix.starts_with(rule.prefix()) {
+                    continue;
                 }
             }
             return true;
@@ -217,19 +224,98 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if !self.role.is_empty() {
-                arns.push(self.role.clone()); // Use the legacy RoleArn when present
-                return arns;
-            }
-
-            if !targets_map.contains(&rule.destination.bucket) {
+            if !rule.destination.bucket.is_empty() && !targets_map.contains(&rule.destination.bucket) {
                 targets_map.insert(rule.destination.bucket.clone());
             }
+        }
+
+        if targets_map.is_empty() && !self.role.is_empty() {
+            arns.push(self.role.clone());
+            return arns;
         }
 
         for arn in targets_map {
             arns.push(arn);
         }
         arns
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s3s::dto::{DeleteMarkerReplication, Destination, ExistingObjectReplication, ReplicationRule};
+
+    fn replication_rule(id: &str, arn: &str) -> ReplicationRule {
+        ReplicationRule {
+            delete_marker_replication: Some(DeleteMarkerReplication::default()),
+            delete_replication: None,
+            destination: Destination {
+                bucket: arn.to_string(),
+                ..Default::default()
+            },
+            existing_object_replication: Some(ExistingObjectReplication {
+                status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+            }),
+            filter: None,
+            id: Some(id.to_string()),
+            prefix: Some(String::new()),
+            priority: Some(1),
+            source_selection_criteria: None,
+            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+        }
+    }
+
+    #[test]
+    fn filter_target_arns_keeps_multiple_destinations_when_role_is_present() {
+        let config = ReplicationConfiguration {
+            role: "arn:legacy:target".to_string(),
+            rules: vec![
+                replication_rule("rule-1", "arn:target:a"),
+                replication_rule("rule-2", "arn:target:b"),
+            ],
+        };
+
+        let arns = config.filter_target_arns(&ObjectOpts {
+            name: "object".to_string(),
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        });
+
+        assert_eq!(arns.len(), 2);
+        assert!(arns.iter().any(|arn| arn == "arn:target:a"));
+        assert!(arns.iter().any(|arn| arn == "arn:target:b"));
+    }
+
+    #[test]
+    fn filter_target_arns_falls_back_to_role_when_destination_is_empty() {
+        let config = ReplicationConfiguration {
+            role: "arn:legacy:target".to_string(),
+            rules: vec![ReplicationRule {
+                delete_marker_replication: Some(DeleteMarkerReplication::default()),
+                delete_replication: None,
+                destination: Destination {
+                    bucket: String::new(),
+                    ..Default::default()
+                },
+                existing_object_replication: Some(ExistingObjectReplication {
+                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                }),
+                filter: None,
+                id: Some("rule-1".to_string()),
+                prefix: Some(String::new()),
+                priority: Some(1),
+                source_selection_criteria: None,
+                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            }],
+        };
+
+        let arns = config.filter_target_arns(&ObjectOpts {
+            name: "object".to_string(),
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        });
+
+        assert_eq!(arns, vec!["arn:legacy:target".to_string()]);
     }
 }

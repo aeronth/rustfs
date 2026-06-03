@@ -1,0 +1,110 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Nix CI
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/nix.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/nix.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  nix-validation:
+    name: Nix Build & Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3.21.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            experimental-features = nix-command flakes
+            max-jobs = 1
+
+      - name: Cache Nix
+        uses: DeterminateSystems/flakehub-cache-action@v3.21.0
+
+      - name: Check Nix Flake Inputs
+        uses: DeterminateSystems/flake-checker-action@v12
+        with:
+          fail-mode: true
+          ignore-missing-flake-lock: false
+
+      - name: Verify Flake
+        run: |
+          echo "Checking flake structure and evaluation..."
+          nix flake show
+          for attempt in 1 2 3; do
+            if nix flake check --print-build-logs --fallback --option fallback true; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "nix flake check failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+
+      - name: Build RustFS
+        run: |
+          echo "Building the default package..."
+          for attempt in 1 2 3; do
+            if nix build .#default --print-build-logs --fallback --option fallback true; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "nix build failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+
+      - name: Test Binary
+        run: |
+          echo "Verifying the built binary..."
+          if [ -x "./result/bin/rustfs" ]; then
+              ./result/bin/rustfs --help
+              echo "Binary verification successful."
+          else
+              echo "Error: Binary not found or not executable at ./result/bin/rustfs"
+              exit 1
+          fi

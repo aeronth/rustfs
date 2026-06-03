@@ -31,11 +31,12 @@ process_data_volumes() {
   VOLUME_LIST=""
   for vol in $VOLUME_LIST_RAW; do
       # Helper to manually expand {N..M} since sh doesn't support it on variables
-      if echo "$vol" | grep -E -q "\{[0-9]+\.\.[0-9]+\}"; then
+      if echo "$vol" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; then
            PREFIX=${vol%%\{*}
            SUFFIX=${vol##*\}}
            RANGE=${vol#*\{}
            RANGE=${RANGE%\}}
+           RANGE=$(echo "$RANGE" | sed 's/\.\.\./../')
            START=${RANGE%%..*}
            END=${RANGE##*..}
            
@@ -57,15 +58,8 @@ process_data_volumes() {
 
   for vol in $VOLUME_LIST; do
     case "$vol" in
-      /*)
-        case "$vol" in
-          http://*|https://*) : ;;
-          *) DATA_VOLUMES="$DATA_VOLUMES $vol" ;;
-        esac
-        ;;
-      *)
-        : # skip non-local paths
-        ;;
+      /*) DATA_VOLUMES="$DATA_VOLUMES $vol" ;;
+      *)  : ;; # skip non-absolute paths (including http(s):// URLs)
     esac
   done
   
@@ -119,7 +113,7 @@ process_data_volumes
 process_log_directory
 
 # 4) Default credentials warning
-if [ "${RUSTFS_ACCESS_KEY}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY}" = "rustfsadmin" ]; then
+if [ "${RUSTFS_ACCESS_KEY:-}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY:-}" = "rustfsadmin" ]; then
   echo "!!!WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY. Override them in production!"
 fi
 

@@ -18,14 +18,12 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use rustfs_data_usage::TierStats;
 use sha2::Sha256;
-
 use std::collections::HashMap;
 use std::ops::Sub;
 use time::OffsetDateTime;
 use tracing::{error, warn};
-
-use rustfs_common::data_usage::TierStats;
 
 pub type DailyAllTierStats = HashMap<String, LastDayTierStats>;
 
@@ -51,6 +49,10 @@ impl LastDayTierStats {
 
         let now_idx = now.hour() as usize;
         self.bins[now_idx] = self.bins[now_idx].add(&ts);
+    }
+
+    pub fn total(&self) -> TierStats {
+        self.bins.iter().fold(TierStats::default(), |acc, bin| acc.add(bin))
     }
 
     fn forward_to(&mut self, t: &mut OffsetDateTime) {
@@ -81,7 +83,7 @@ impl LastDayTierStats {
     #[allow(dead_code)]
     fn merge(&self, m: LastDayTierStats) -> LastDayTierStats {
         let mut cl = self.clone();
-        let mut cm = m.clone();
+        let mut cm = m;
         let mut merged = LastDayTierStats::default();
 
         if cl.updated_at.unix_timestamp() > cm.updated_at.unix_timestamp() {
@@ -101,4 +103,30 @@ impl LastDayTierStats {
 }
 
 #[cfg(test)]
-mod test {}
+mod test {
+    use super::*;
+
+    #[test]
+    fn total_sums_all_recorded_stats() {
+        let mut stats = LastDayTierStats::default();
+        stats.add_stats(TierStats {
+            total_size: 10,
+            num_versions: 1,
+            num_objects: 1,
+        });
+        stats.add_stats(TierStats {
+            total_size: 20,
+            num_versions: 2,
+            num_objects: 0,
+        });
+
+        assert_eq!(
+            stats.total(),
+            TierStats {
+                total_size: 30,
+                num_versions: 3,
+                num_objects: 1,
+            }
+        );
+    }
+}

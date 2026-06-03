@@ -18,7 +18,11 @@ set -euo pipefail
 # Disable proxy for localhost requests to avoid interference
 export NO_PROXY="127.0.0.1,localhost,::1"
 export no_proxy="${NO_PROXY}"
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+# Keep proxy variables for external downloads; NO_PROXY bypasses localhost.
+
+# Ensure user-level Python scripts are discoverable (awscurl/tox installed via --user)
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.14")
+export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
 
 # Configuration
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
@@ -33,30 +37,18 @@ S3_PORT="${S3_PORT:-9000}"
 TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
 XDIST="${XDIST:-0}"
-MARKEXPR="${MARKEXPR:-not lifecycle and not versioning and not s3website and not bucket_logging and not encryption}"
 
-# Configuration file paths
-S3TESTS_CONF_TEMPLATE="${S3TESTS_CONF_TEMPLATE:-.github/s3tests/s3tests.conf}"
-S3TESTS_CONF="${S3TESTS_CONF:-s3tests.conf}"
+# Compatibility default for the s3-tests harness:
+# this script provisions multiple local export directories on the same physical disk.
+# Prefer the canonical bypass knob by default, and only honor the legacy CI alias
+# when it is already provided by the environment.
+if [ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ] && [ -z "${MINIO_CI+x}" ]; then
+    export RUSTFS_UNSAFE_BYPASS_DISK_CHECK="true"
+fi
 
-# Service deployment mode: "build", "binary", "docker", or "existing"
-# - "build": Compile with cargo build --release and run (default)
-# - "binary": Use pre-compiled binary (RUSTFS_BINARY path or default)
-# - "docker": Build Docker image and run in container
-# - "existing": Use already running service (skip start, use S3_HOST and S3_PORT)
-DEPLOY_MODE="${DEPLOY_MODE:-build}"
-RUSTFS_BINARY="${RUSTFS_BINARY:-}"
-NO_CACHE="${NO_CACHE:-false}"
-
-# Directories
+# Directories (define early for use in test list loading)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-ARTIFACTS_DIR="${PROJECT_ROOT}/artifacts/s3tests-${TEST_MODE}"
-CONTAINER_NAME="rustfs-${TEST_MODE}"
-NETWORK_NAME="rustfs-net"
-DATA_ROOT="${DATA_ROOT:-target}"
-DATA_DIR="${PROJECT_ROOT}/${DATA_ROOT}/test-data/${CONTAINER_NAME}"
-RUSTFS_PID=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -76,6 +68,141 @@ log_warn() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $*"
 }
+
+# =============================================================================
+# Test Classification Files
+# =============================================================================
+# Tests are classified into three categories stored in text files:
+#   - implemented_tests.txt:   Tests that should pass on RustFS
+#   - unimplemented_tests.txt: Standard S3 features planned but not yet implemented
+#   - excluded_tests.txt:      Tests intentionally excluded from RustFS gating
+#
+# By default, only tests listed in implemented_tests.txt are run.
+# Use TESTEXPR env var to override and run custom test selection.
+# =============================================================================
+
+# Test list files location
+TEST_LISTS_DIR="${SCRIPT_DIR}"
+IMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/implemented_tests.txt"
+UNIMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/unimplemented_tests.txt"
+EXCLUDED_TESTS_FILE="${TEST_LISTS_DIR}/excluded_tests.txt"
+S3_TEST_FILE="s3tests/functional/test_s3.py"
+
+# =============================================================================
+# load_testnodes_from_file: Read test names and build exact pytest node ids
+# =============================================================================
+# Pytest -k matches substrings, so similar test names can accidentally include or
+# exclude each other. The default file-based path uses exact node ids instead.
+# =============================================================================
+TEST_NODE_ARGS=()
+USE_FILE_TEST_NODES=false
+
+load_testnodes_from_file() {
+    local file="$1"
+    local line=""
+
+    if [[ ! -f "${file}" ]]; then
+        log_error "Test list file not found: ${file}"
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # Trim whitespace
+        line=$(echo "$line" | xargs)
+        [[ -z "$line" ]] && continue
+
+        TEST_NODE_ARGS+=("${S3_TEST_FILE}::${line}")
+    done < "${file}"
+}
+
+# =============================================================================
+# MARKEXPR: pytest marker expression
+# =============================================================================
+# File-based test selection is authoritative. Keep the default marker expression
+# non-restrictive so implemented tests that carry upstream compatibility markers
+# are still run when they are listed in implemented_tests.txt.
+# =============================================================================
+if [[ -z "${MARKEXPR:-}" ]]; then
+    # Valid pytest -m expression that does not match any real marker.
+    MARKEXPR="not rustfs_never_marker"
+fi
+
+# =============================================================================
+# TESTEXPR: optional pytest -k expression to select specific tests
+# =============================================================================
+# By default, loads exact pytest node ids from implemented_tests.txt.
+# Set TESTEXPR to override this with a custom pytest -k expression.
+#
+# The file-based approach provides:
+#   1. Clear visibility of which tests are run
+#   2. Easy maintenance - edit txt files to add/remove tests
+#   3. Separation of concerns - test classification vs test execution
+# =============================================================================
+if [[ -z "${TESTEXPR:-}" ]]; then
+    if [[ -f "${IMPLEMENTED_TESTS_FILE}" ]]; then
+        log_info "Loading test list from: ${IMPLEMENTED_TESTS_FILE}"
+        load_testnodes_from_file "${IMPLEMENTED_TESTS_FILE}"
+        TEST_COUNT="${#TEST_NODE_ARGS[@]}"
+        if [[ "${TEST_COUNT}" -eq 0 ]]; then
+            log_error "No tests found in ${IMPLEMENTED_TESTS_FILE}"
+            exit 1
+        fi
+        USE_FILE_TEST_NODES=true
+        log_info "Loaded ${TEST_COUNT} exact test nodes from implemented_tests.txt"
+    else
+        log_warn "Test list file not found: ${IMPLEMENTED_TESTS_FILE}"
+        log_warn "Falling back to exclusion-based filtering"
+        EXCLUDED_TESTS=(
+            "test_post_object"
+            "test_bucket_list_objects_anonymous"
+            "test_bucket_listv2_objects_anonymous"
+            "test_bucket_concurrent_set_canned_acl"
+            "test_bucket_acl"
+            "test_object_acl"
+            "test_access_bucket"
+            "test_100_continue"
+            "test_cors"
+            "test_object_raw"
+            "test_versioning"
+            "test_versioned"
+        )
+        TESTEXPR=""
+        for pattern in "${EXCLUDED_TESTS[@]}"; do
+            if [[ -n "${TESTEXPR}" ]]; then
+                TESTEXPR+=" and "
+            fi
+            TESTEXPR+="not ${pattern}"
+        done
+    fi
+fi
+
+# Configuration file paths
+S3TESTS_CONF_TEMPLATE="${S3TESTS_CONF_TEMPLATE:-.github/s3tests/s3tests.conf}"
+S3TESTS_CONF="${S3TESTS_CONF:-s3tests.conf}"
+
+# Service deployment mode: "build", "binary", "docker", or "existing"
+# - "build": Compile with cargo build --release and run (default)
+# - "binary": Use pre-compiled binary (RUSTFS_BINARY path or default)
+# - "docker": Build Docker image and run in container
+# - "existing": Use already running service (skip start, use S3_HOST and S3_PORT)
+DEPLOY_MODE="${DEPLOY_MODE:-build}"
+RUSTFS_BINARY="${RUSTFS_BINARY:-}"
+NO_CACHE="${NO_CACHE:-false}"
+
+# Additional directories (SCRIPT_DIR and PROJECT_ROOT defined earlier)
+ARTIFACTS_DIR="${PROJECT_ROOT}/artifacts/s3tests-${TEST_MODE}"
+CONTAINER_NAME="rustfs-${TEST_MODE}"
+NETWORK_NAME="rustfs-net"
+DATA_ROOT="${DATA_ROOT:-target}"
+if [[ "${DATA_ROOT}" = /* ]]; then
+    DATA_BASE="${DATA_ROOT}"
+else
+    DATA_BASE="${PROJECT_ROOT}/${DATA_ROOT}"
+fi
+DATA_DIR="${DATA_BASE}/test-data/${CONTAINER_NAME}"
+RUSTFS_PID=""
 
 show_usage() {
     cat << EOF
@@ -102,14 +229,22 @@ Environment Variables:
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
   MAXFAIL                - Stop after N failures (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
-  MARKEXPR               - pytest marker expression (default: exclude unsupported features)
+  MARKEXPR               - pytest marker expression (default: no marker filtering)
+  TESTEXPR               - pytest -k expression (overrides implemented_tests.txt node list)
   S3TESTS_CONF_TEMPLATE  - Path to s3tests config template (default: .github/s3tests/s3tests.conf)
   S3TESTS_CONF           - Path to generated s3tests config (default: s3tests.conf)
   DATA_ROOT              - Root directory for test data storage (default: target)
-                            Final path: ${DATA_ROOT}/test-data/${CONTAINER_NAME}
+                            Final path: \${DATA_ROOT}/test-data/\${CONTAINER_NAME}
+
+Test Classification Files (in scripts/s3-tests/):
+  implemented_tests.txt    - Implemented tests (run by default)
+  unimplemented_tests.txt  - Standard S3 tests planned but not implemented
+  excluded_tests.txt       - Tests intentionally excluded from RustFS gating
 
 Notes:
-  - In build mode, if the binary exists and was compiled less than 5 minutes ago,
+  - Tests are loaded from implemented_tests.txt by default
+  - Set TESTEXPR to override with custom test selection
+  - In build mode, if the binary exists and was compiled less than 30 minutes ago,
     compilation will be skipped unless --no-cache is specified.
 
 Examples:
@@ -383,7 +518,24 @@ check_server_ready_from_log() {
 
 # Test S3 API readiness
 test_s3_api_ready() {
-    # Try awscurl first if available
+    # Step 1: Check if server is responding using /health endpoint
+    # /health is a probe path that bypasses readiness gate, so it can be used
+    # to check if the server is up and running, even if readiness gate is not ready yet
+    HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X GET \
+        "http://${S3_HOST}:${S3_PORT}/health" \
+        --max-time 5 2>/dev/null || echo "000")
+
+    if [ "${HEALTH_CODE}" = "000" ]; then
+        # Connection failed - server might not be running or not listening yet
+        return 1
+    elif [ "${HEALTH_CODE}" != "200" ]; then
+        # Health endpoint returned non-200 status, server might have issues
+        return 1
+    fi
+
+    # Step 2: Test S3 API with signed request (awscurl) if available
+    # This tests if S3 API is actually ready and can process requests
     if command -v awscurl >/dev/null 2>&1; then
         export PATH="$HOME/.local/bin:$PATH"
         RESPONSE=$(awscurl --service s3 --region "${S3_REGION}" \
@@ -392,18 +544,24 @@ test_s3_api_ready() {
             -X GET "http://${S3_HOST}:${S3_PORT}/" 2>&1)
 
         if echo "${RESPONSE}" | grep -q "<ListAllMyBucketsResult"; then
+            # S3 API is ready and responding correctly
             return 0
         fi
+        # If awscurl failed, check if it's a 503 (Service Unavailable) which means not ready
+        if echo "${RESPONSE}" | grep -q "503\|Service not ready"; then
+            return 1  # Not ready yet (readiness gate is blocking S3 API)
+        fi
+        # Other errors from awscurl - might be auth issues or other problems
+        # But server is up, so we'll consider it ready (S3 API might have other issues)
+        return 0
     fi
 
-    # Fallback: test /health endpoint (this bypasses readiness gate)
-    if curl -sf "http://${S3_HOST}:${S3_PORT}/health" >/dev/null 2>&1; then
-        # Health endpoint works, but we need to verify S3 API works too
-        # Wait a bit more for FullReady to be fully set
-        return 1  # Not fully ready yet, but progressing
-    fi
-
-    return 1  # Not ready
+    # Step 3: Fallback - if /health returns 200, server is up and readiness gate is ready
+    # Since /health is a probe path and returns 200, and we don't have awscurl to test S3 API,
+    # we can assume the server is ready. The readiness gate would have blocked /health if not ready.
+    # Note: Root path "/" with HEAD method returns 501 Not Implemented (S3 doesn't support HEAD on root),
+    # so we can't use it as a reliable test. Since /health already confirmed readiness, we return success.
+    return 0
 }
 
 # First, wait for server to log "server started successfully"
@@ -445,16 +603,41 @@ for i in {1..20}; do
             fi
         fi
 
-        # Show last test attempt
-        log_error "Last S3 API test:"
+        # Show last test attempt with detailed diagnostics
+        log_error "Last S3 API readiness test diagnostics:"
+
+        # Test /health endpoint (probe path, bypasses readiness gate)
+        log_error "Step 1: Testing /health endpoint (probe path):"
+        HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X GET \
+            "http://${S3_HOST}:${S3_PORT}/health" \
+            --max-time 5 2>&1 || echo "000")
+        log_error "  /health HTTP status code: ${HEALTH_CODE}"
+        if [ "${HEALTH_CODE}" != "200" ]; then
+            log_error "  /health endpoint response:"
+            curl -s "http://${S3_HOST}:${S3_PORT}/health" 2>&1 | head -5 || true
+        fi
+
+        # Test S3 API with signed request if awscurl is available
         if command -v awscurl >/dev/null 2>&1; then
             export PATH="$HOME/.local/bin:$PATH"
+            log_error "Step 2: Testing S3 API with awscurl (signed request):"
             awscurl --service s3 --region "${S3_REGION}" \
                 --access_key "${S3_ACCESS_KEY}" \
                 --secret_key "${S3_SECRET_KEY}" \
                 -X GET "http://${S3_HOST}:${S3_PORT}/" 2>&1 | head -20
         else
-            curl -v "http://${S3_HOST}:${S3_PORT}/health" 2>&1 | head -10
+            log_error "Step 2: Testing S3 API root path (unsigned HEAD request):"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X HEAD \
+                "http://${S3_HOST}:${S3_PORT}/" \
+                --max-time 5 2>&1 || echo "000")
+            log_error "  Root path HTTP status code: ${HTTP_CODE}"
+            if [ "${HTTP_CODE}" = "503" ]; then
+                log_error "  Note: 503 indicates readiness gate is blocking (service not ready)"
+            elif [ "${HTTP_CODE}" = "000" ]; then
+                log_error "  Note: 000 indicates connection failure"
+            fi
         fi
 
         # Output logs based on deployment mode
@@ -477,8 +660,16 @@ log_info "Generating s3tests config..."
 mkdir -p "${ARTIFACTS_DIR}"
 
 # Resolve template and output paths (relative to PROJECT_ROOT)
-TEMPLATE_PATH="${PROJECT_ROOT}/${S3TESTS_CONF_TEMPLATE}"
-CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+if [[ "${S3TESTS_CONF_TEMPLATE}" = /* ]]; then
+    TEMPLATE_PATH="${S3TESTS_CONF_TEMPLATE}"
+else
+    TEMPLATE_PATH="${PROJECT_ROOT}/${S3TESTS_CONF_TEMPLATE}"
+fi
+if [[ "${S3TESTS_CONF}" = /* ]]; then
+    CONF_OUTPUT_PATH="${S3TESTS_CONF}"
+else
+    CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+fi
 
 # Check if template exists
 if [ ! -f "${TEMPLATE_PATH}" ]; then
@@ -503,24 +694,67 @@ fi
 
 log_info "Using template: ${TEMPLATE_PATH}"
 log_info "Generating config: ${CONF_OUTPUT_PATH}"
+mkdir -p "$(dirname "${CONF_OUTPUT_PATH}")"
 
-export S3_HOST
+# Export all required variables for envsubst
+export S3_HOST S3_PORT S3_ACCESS_KEY S3_SECRET_KEY S3_ALT_ACCESS_KEY S3_ALT_SECRET_KEY
 envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
     log_error "Failed to generate s3tests config"
     exit 1
 }
 
 # Step 7: Provision s3-tests alt user
+# Note: Main user (rustfsadmin) is a system user and doesn't need to be created via API
 log_info "Provisioning s3-tests alt user..."
+
+# Helper function to install Python packages with fallback for externally-managed environments
+install_python_package() {
+    local package=$1
+    local error_output
+
+    # Try --user first (works on most Linux systems)
+    error_output=$(python3 -m pip install --user --upgrade pip "${package}" 2>&1)
+    if [ $? -eq 0 ]; then
+        return 0
+    fi
+
+    # If that fails with externally-managed-environment error, try with --break-system-packages
+    if echo "${error_output}" | grep -q "externally-managed-environment"; then
+        log_warn "Detected externally-managed Python environment, using --break-system-packages flag"
+        python3 -m pip install --user --break-system-packages --upgrade pip "${package}" || {
+            log_error "Failed to install ${package} even with --break-system-packages"
+            return 1
+        }
+        return 0
+    fi
+
+    # Other errors - show the error output
+    log_error "Failed to install ${package}: ${error_output}"
+    return 1
+}
+
 if ! command -v awscurl >/dev/null 2>&1; then
-    python3 -m pip install --user --upgrade pip awscurl || {
+    install_python_package awscurl || {
         log_error "Failed to install awscurl"
         exit 1
     }
-    export PATH="$HOME/.local/bin:$PATH"
+    # Add common Python user bin directories to PATH
+    # macOS: ~/Library/Python/X.Y/bin
+    # Linux: ~/.local/bin
+    PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.14")
+    export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
+    # Verify awscurl is now available
+    if ! command -v awscurl >/dev/null 2>&1; then
+        log_error "awscurl installed but not found in PATH. Tried:"
+        log_error "  - $HOME/Library/Python/${PYTHON_VERSION}/bin"
+        log_error "  - $HOME/.local/bin"
+        log_error "Please ensure awscurl is in your PATH"
+        exit 1
+    fi
 fi
 
-# Admin API requires AWS SigV4 signing
+# Provision alt user (required by suite)
+log_info "Provisioning alt user (${S3_ALT_ACCESS_KEY})..."
 awscurl \
     --service s3 \
     --region "${S3_REGION}" \
@@ -573,11 +807,13 @@ cd "${PROJECT_ROOT}/s3-tests"
 
 # Install tox if not available
 if ! command -v tox >/dev/null 2>&1; then
-    python3 -m pip install --user --upgrade pip tox || {
+    install_python_package tox || {
         log_error "Failed to install tox"
         exit 1
     }
-    export PATH="$HOME/.local/bin:$PATH"
+    # Add common Python user bin directories to PATH (same as awscurl)
+    PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.14")
+    export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
 fi
 
 # Step 9: Run ceph s3-tests
@@ -592,7 +828,18 @@ if [ "${XDIST}" != "0" ]; then
 fi
 
 # Resolve config path (absolute path for tox)
-CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+if [[ "${S3TESTS_CONF}" = /* ]]; then
+    CONF_OUTPUT_PATH="${S3TESTS_CONF}"
+else
+    CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+fi
+
+PYTEST_SELECTION_ARGS=()
+if [[ "${USE_FILE_TEST_NODES}" == "true" ]]; then
+    PYTEST_SELECTION_ARGS=("${TEST_NODE_ARGS[@]}")
+else
+    PYTEST_SELECTION_ARGS=("${S3_TEST_FILE}" -k "${TESTEXPR}")
+fi
 
 # Run tests from s3tests/functional
 S3TEST_CONF="${CONF_OUTPUT_PATH}" \
@@ -601,7 +848,7 @@ S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     --maxfail="${MAXFAIL}" \
     --junitxml="${ARTIFACTS_DIR}/junit.xml" \
     ${XDIST_ARGS} \
-    s3tests/functional/test_s3.py \
+    "${PYTEST_SELECTION_ARGS[@]}" \
     -m "${MARKEXPR}" \
     2>&1 | tee "${ARTIFACTS_DIR}/pytest.log"
 

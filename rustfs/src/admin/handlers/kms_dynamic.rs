@@ -14,27 +14,78 @@
 
 //! KMS dynamic configuration admin API handlers
 
-use super::Operation;
 use crate::admin::auth::validate_admin_request;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_kms_runtime_service_manager;
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::RemoteAddr;
-use hyper::StatusCode;
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_kms::{
     ConfigureKmsRequest, ConfigureKmsResponse, KmsConfig, KmsConfigSummary, KmsServiceStatus, KmsStatusResponse, StartKmsRequest,
-    StartKmsResponse, StopKmsResponse, get_global_kms_service_manager,
+    StartKmsResponse, StopKmsResponse,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 /// Path to store KMS configuration in the cluster metadata
 const KMS_CONFIG_PATH: &str = "config/kms_config.json";
 
+fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceManager> {
+    resolve_kms_runtime_service_manager().unwrap_or_else(|| {
+        warn!("KMS service manager not initialized, initializing now as fallback");
+        rustfs_kms::init_global_kms_service_manager()
+    })
+}
+
+fn token_is_blank(auth_method: &rustfs_kms::config::VaultAuthMethod) -> bool {
+    matches!(
+        auth_method,
+        rustfs_kms::config::VaultAuthMethod::Token { token } if token.trim().is_empty()
+    )
+}
+
+fn existing_vault_auth(config: &KmsConfig) -> Option<rustfs_kms::config::VaultAuthMethod> {
+    match &config.backend_config {
+        rustfs_kms::config::BackendConfig::VaultKv2(vault) => Some(vault.auth_method.clone()),
+        rustfs_kms::config::BackendConfig::VaultTransit(vault) => Some(vault.auth_method.clone()),
+        rustfs_kms::config::BackendConfig::Local(_) => None,
+    }
+}
+
+fn normalize_configure_request_auth(
+    request: &mut ConfigureKmsRequest,
+    existing_config: Option<&KmsConfig>,
+) -> Result<(), String> {
+    let needs_existing_auth = match request {
+        ConfigureKmsRequest::VaultKv2(req) => token_is_blank(&req.auth_method),
+        ConfigureKmsRequest::VaultTransit(req) => token_is_blank(&req.auth_method),
+        ConfigureKmsRequest::Local(_) => false,
+    };
+
+    if !needs_existing_auth {
+        return Ok(());
+    }
+
+    let existing_auth = existing_config
+        .and_then(existing_vault_auth)
+        .ok_or_else(|| "Vault token is required when no existing KMS credentials are available".to_string())?;
+
+    match request {
+        ConfigureKmsRequest::VaultKv2(req) => req.auth_method = existing_auth,
+        ConfigureKmsRequest::VaultTransit(req) => req.auth_method = existing_auth,
+        ConfigureKmsRequest::Local(_) => {}
+    }
+
+    Ok(())
+}
+
 /// Save KMS configuration to cluster storage
+#[instrument(skip(config))]
 async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
     let Some(store) = new_object_layer_fn() else {
         return Err("Storage layer not initialized".to_string());
@@ -51,6 +102,7 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
 }
 
 /// Load KMS configuration from cluster storage
+#[instrument]
 pub async fn load_kms_config() -> Option<KmsConfig> {
     let Some(store) = new_object_layer_fn() else {
         warn!("Storage layer not initialized, cannot load KMS config");
@@ -80,6 +132,40 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
     }
 }
 
+pub fn register_kms_dynamic_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/configure").as_str(),
+        AdminOperation(&ConfigureKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/start").as_str(),
+        AdminOperation(&StartKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/stop").as_str(),
+        AdminOperation(&StopKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/service-status").as_str(),
+        AdminOperation(&GetKmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/reconfigure").as_str(),
+        AdminOperation(&ReconfigureKmsHandler {}),
+    )?;
+
+    Ok(())
+}
+
 /// Configure KMS service handler
 pub struct ConfigureKmsHandler;
 
@@ -99,7 +185,7 @@ impl Operation for ConfigureKmsHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -109,7 +195,7 @@ impl Operation for ConfigureKmsHandler {
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
-        let configure_request: ConfigureKmsRequest = if body.is_empty() {
+        let mut configure_request: ConfigureKmsRequest = if body.is_empty() {
             return Ok(S3Response::new((
                 StatusCode::BAD_REQUEST,
                 Body::from("Request body is required".to_string()),
@@ -124,13 +210,14 @@ impl Operation for ConfigureKmsHandler {
             }
         };
 
-        info!("Configuring KMS with request: {:?}", configure_request);
+        info!("Configuring KMS from admin request");
 
-        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
-            warn!("KMS service manager not initialized, initializing now as fallback");
-            // Initialize the service manager as a fallback
-            rustfs_kms::init_global_kms_service_manager()
-        });
+        let service_manager = kms_service_manager_from_context();
+        let existing_config = service_manager.get_config().await;
+
+        if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+        }
 
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();
@@ -198,7 +285,7 @@ impl Operation for StartKmsHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -222,11 +309,7 @@ impl Operation for StartKmsHandler {
 
         info!("Starting KMS service with force: {:?}", start_request.force);
 
-        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
-            warn!("KMS service manager not initialized, initializing now as fallback");
-            // Initialize the service manager as a fallback
-            rustfs_kms::init_global_kms_service_manager()
-        });
+        let service_manager = kms_service_manager_from_context();
 
         // Check if already running and force flag
         let current_status = service_manager.get_status().await;
@@ -332,17 +415,13 @@ impl Operation for StopKmsHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
         info!("Stopping KMS service");
 
-        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
-            warn!("KMS service manager not initialized, initializing now as fallback");
-            // Initialize the service manager as a fallback
-            rustfs_kms::init_global_kms_service_manager()
-        });
+        let service_manager = kms_service_manager_from_context();
 
         let (success, message, status) = match service_manager.stop().await {
             Ok(()) => {
@@ -398,17 +477,13 @@ impl Operation for GetKmsStatusHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
         info!("Getting KMS service status");
 
-        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
-            warn!("KMS service manager not initialized, initializing now as fallback");
-            // Initialize the service manager as a fallback
-            rustfs_kms::init_global_kms_service_manager()
-        });
+        let service_manager = kms_service_manager_from_context();
 
         let status = service_manager.get_status().await;
         let config = service_manager.get_config().await;
@@ -470,7 +545,7 @@ impl Operation for ReconfigureKmsHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -480,7 +555,7 @@ impl Operation for ReconfigureKmsHandler {
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
-        let configure_request: ConfigureKmsRequest = if body.is_empty() {
+        let mut configure_request: ConfigureKmsRequest = if body.is_empty() {
             return Ok(S3Response::new((
                 StatusCode::BAD_REQUEST,
                 Body::from("Request body is required".to_string()),
@@ -495,13 +570,14 @@ impl Operation for ReconfigureKmsHandler {
             }
         };
 
-        info!("Reconfiguring KMS with request: {:?}", configure_request);
+        info!("Reconfiguring KMS");
 
-        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
-            warn!("KMS service manager not initialized, initializing now as fallback");
-            // Initialize the service manager as a fallback
-            rustfs_kms::init_global_kms_service_manager()
-        });
+        let service_manager = kms_service_manager_from_context();
+        let existing_config = service_manager.get_config().await;
+
+        if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+        }
 
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();

@@ -17,6 +17,7 @@ pub mod com;
 #[allow(dead_code)]
 pub mod heal;
 mod notify;
+mod oidc;
 pub mod storageclass;
 
 use crate::error::Result;
@@ -24,22 +25,26 @@ use crate::store::ECStore;
 use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
 use rustfs_config::COMMENT_KEY;
 use rustfs_config::DEFAULT_DELIMITER;
-use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
-use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::audit::{
+    AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_SUB_SYS,
+    AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS,
+};
+use rustfs_config::notify::{
+    NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS,
+    NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+};
+use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
-pub static GLOBAL_STORAGE_CLASS: LazyLock<OnceLock<storageclass::Config>> = LazyLock::new(OnceLock::new);
+pub static GLOBAL_STORAGE_CLASS: LazyLock<RwLock<storageclass::Config>> =
+    LazyLock::new(|| RwLock::new(storageclass::Config::default()));
 pub static DEFAULT_KVS: LazyLock<OnceLock<HashMap<String, KVS>>> = LazyLock::new(OnceLock::new);
-pub static GLOBAL_SERVER_CONFIG: LazyLock<OnceLock<Config>> = LazyLock::new(OnceLock::new);
+pub static GLOBAL_SERVER_CONFIG: LazyLock<RwLock<Option<Config>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_CONFIG_SYS: LazyLock<ConfigSys> = LazyLock::new(ConfigSys::new);
 
-pub const ENV_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
-pub const ENV_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
-pub const ENV_ROOT_USER: &str = "RUSTFS_ROOT_USER";
-pub const ENV_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
 pub static RUSTFS_CONFIG_PREFIX: &str = "config";
 
 pub struct ConfigSys {}
@@ -59,20 +64,49 @@ impl ConfigSys {
 
         lookup_configs(&mut cfg, api).await;
 
-        let _ = GLOBAL_SERVER_CONFIG.set(cfg);
+        set_global_server_config(cfg);
 
         Ok(())
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+pub fn get_global_server_config() -> Option<Config> {
+    GLOBAL_SERVER_CONFIG.read().ok().and_then(|guard| (*guard).clone())
+}
+
+pub fn set_global_server_config(cfg: Config) {
+    if let Ok(mut guard) = GLOBAL_SERVER_CONFIG.write() {
+        *guard = Some(cfg);
+    }
+}
+
+pub fn get_global_storage_class() -> Option<storageclass::Config> {
+    GLOBAL_STORAGE_CLASS.read().ok().map(|guard| (*guard).clone())
+}
+
+pub fn set_global_storage_class(cfg: storageclass::Config) {
+    if let Ok(mut guard) = GLOBAL_STORAGE_CLASS.write() {
+        *guard = cfg;
+    }
+}
+
+pub async fn init_global_config_sys(api: Arc<ECStore>) -> Result<()> {
+    GLOBAL_CONFIG_SYS.init(api).await
+}
+
+pub async fn try_migrate_server_config(api: Arc<ECStore>) {
+    com::try_migrate_server_config(api).await
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct KV {
     pub key: String,
     pub value: String,
+    #[serde(default, alias = "hiddenIfEmpty")]
     pub hidden_if_empty: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct KVS(pub Vec<KV>);
 
 impl Default for KVS {
@@ -129,7 +163,7 @@ impl KVS {
     pub fn insert(&mut self, key: String, value: String) {
         for kv in self.0.iter_mut() {
             if kv.key == key {
-                kv.value = value.clone();
+                kv.value = value;
                 return;
             }
         }
@@ -148,7 +182,7 @@ impl KVS {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config(pub HashMap<String, HashMap<String, KVS>>);
 
 impl Default for Config {
@@ -180,10 +214,10 @@ impl Config {
                     let mut default = HashMap::new();
                     default.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
                     self.0.insert(k.clone(), default);
-                } else if !self.0[k].contains_key(DEFAULT_DELIMITER) {
-                    if let Some(m) = self.0.get_mut(k) {
-                        m.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
-                    }
+                } else if !self.0[k].contains_key(DEFAULT_DELIMITER)
+                    && let Some(m) = self.0.get_mut(k)
+                {
+                    m.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
                 }
             }
         }
@@ -226,7 +260,44 @@ pub fn init() {
     kvs.insert(AUDIT_WEBHOOK_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_WEBHOOK_KVS.clone());
     kvs.insert(NOTIFY_MQTT_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_MQTT_KVS.clone());
     kvs.insert(AUDIT_MQTT_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_MQTT_KVS.clone());
+    kvs.insert(NOTIFY_AMQP_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_AMQP_KVS.clone());
+    kvs.insert(AUDIT_AMQP_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_AMQP_KVS.clone());
+    kvs.insert(NOTIFY_NATS_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_NATS_KVS.clone());
+    kvs.insert(AUDIT_NATS_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_NATS_KVS.clone());
+    kvs.insert(NOTIFY_REDIS_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_REDIS_KVS.clone());
+    kvs.insert(AUDIT_REDIS_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_REDIS_KVS.clone());
+    kvs.insert(NOTIFY_POSTGRES_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_POSTGRES_KVS.clone());
+    kvs.insert(AUDIT_POSTGRES_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_POSTGRES_KVS.clone());
+    kvs.insert(NOTIFY_PULSAR_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_PULSAR_KVS.clone());
+    kvs.insert(AUDIT_PULSAR_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_PULSAR_KVS.clone());
+    kvs.insert(NOTIFY_KAFKA_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_KAFKA_KVS.clone());
+    kvs.insert(AUDIT_KAFKA_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_KAFKA_KVS.clone());
+    kvs.insert(NOTIFY_MYSQL_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_MYSQL_KVS.clone());
+    kvs.insert(AUDIT_MYSQL_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_MYSQL_KVS.clone());
+    kvs.insert(IDENTITY_OPENID_SUB_SYS.to_owned(), oidc::DEFAULT_IDENTITY_OPENID_KVS.clone());
 
     // Register all default configurations
     register_default_kvs(kvs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_server_config_set_and_get_roundtrip() {
+        init();
+        let mut cfg = Config::new();
+        let mut kvs = KVS::new();
+        kvs.insert("standard".to_string(), "EC:4".to_string());
+        cfg.0
+            .insert(STORAGE_CLASS_SUB_SYS.to_string(), HashMap::from([("_".to_string(), kvs)]));
+
+        set_global_server_config(cfg.clone());
+        let loaded = get_global_server_config().expect("global config should be set");
+        let sc_kvs = loaded
+            .get_value(STORAGE_CLASS_SUB_SYS, "_")
+            .expect("storage_class should exist");
+        assert_eq!(sc_kvs.get("standard"), "EC:4");
+    }
 }

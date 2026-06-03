@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    admin_server_info::get_local_server_property,
-    new_object_layer_fn,
-    store_api::StorageAPI,
-    // utils::os::get_drive_stats,
-};
+use crate::{admin_server_info::get_local_server_property, new_object_layer_fn, store_api::StorageAPI};
 use chrono::Utc;
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
-use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};
+use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+use rustfs_madmin::metrics::{
+    DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
+    ScannerMetrics as MadminScannerMetrics, TimedAction as MadminTimedAction,
+};
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -55,6 +54,51 @@ impl MetricType {
 
     pub fn new(t: u32) -> Self {
         Self(t)
+    }
+}
+
+fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsReport) -> MadminScannerMetrics {
+    MadminScannerMetrics {
+        collected_at: metrics.collected_at,
+        current_cycle: metrics.current_cycle,
+        current_started: metrics.current_started,
+        cycles_completed_at: metrics.cycles_completed_at,
+        ongoing_buckets: metrics.ongoing_buckets,
+        life_time_ops: metrics.life_time_ops,
+        life_time_ilm: metrics.life_time_ilm,
+        last_minute: MadminLastMinute {
+            actions: metrics
+                .last_minute
+                .actions
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        MadminTimedAction {
+                            count: value.count,
+                            acc_time: value.acc_time,
+                            bytes: value.bytes,
+                        },
+                    )
+                })
+                .collect(),
+            ilm: metrics
+                .last_minute
+                .ilm
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        MadminTimedAction {
+                            count: value.count,
+                            acc_time: value.acc_time,
+                            bytes: value.bytes,
+                        },
+                    )
+                })
+                .collect(),
+        },
+        active_paths: metrics.active_paths,
     }
 }
 
@@ -112,8 +156,11 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 
     if types.contains(&MetricType::SCANNER) {
         debug!("start get scanner metrics");
-        let metrics = global_metrics().report().await;
-        real_time_metrics.aggregated.scanner = Some(metrics);
+        let mut metrics = global_metrics().report().await;
+        if let Some(init_time) = rustfs_common::get_global_init_time().await {
+            metrics.current_started = init_time;
+        }
+        real_time_metrics.aggregated.scanner = Some(to_madmin_scanner_metrics(metrics));
     }
 
     // if types.contains(&MetricType::OS) {}
@@ -122,13 +169,50 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 
     // if types.contains(&MetricType::SITE_RESYNC) {}
 
-    // if types.contains(&MetricType::NET) {}
+    if types.contains(&MetricType::NET) {
+        let snapshot = global_internode_metrics().snapshot();
+        real_time_metrics.aggregated.net = Some(NetMetrics {
+            collected_at: Utc::now(),
+            interface_name: "internode".to_string(),
+            net_stats: NetDevLine {
+                name: "internode".to_string(),
+                rx_bytes: snapshot.recv_bytes_total,
+                tx_bytes: snapshot.sent_bytes_total,
+                ..Default::default()
+            },
+        });
+    }
 
     // if types.contains(&MetricType::MEM) {}
 
     // if types.contains(&MetricType::CPU) {}
 
-    // if types.contains(&MetricType::RPC) {}
+    if types.contains(&MetricType::RPC) {
+        let collected_at = Utc::now();
+        let snapshot = global_internode_metrics().snapshot();
+        let last_connect_time =
+            chrono::DateTime::<Utc>::from_timestamp_millis(snapshot.last_dial_unix_millis as i64).unwrap_or(collected_at);
+
+        real_time_metrics.aggregated.rpc = Some(RPCMetrics {
+            collected_at,
+            connected: i32::from(snapshot.last_dial_unix_millis > 0),
+            reconnect_count: snapshot.dial_errors_total.min(i32::MAX as u64) as i32,
+            disconnected: 0,
+            outgoing_streams: 0,
+            incoming_streams: 0,
+            outgoing_bytes: snapshot.sent_bytes_total.min(i64::MAX as u64) as i64,
+            incoming_bytes: snapshot.recv_bytes_total.min(i64::MAX as u64) as i64,
+            outgoing_messages: snapshot.outgoing_requests_total.min(i64::MAX as u64) as i64,
+            incoming_messages: snapshot.incoming_requests_total.min(i64::MAX as u64) as i64,
+            out_queue: 0,
+            last_pong_time: collected_at,
+            last_ping_ms: snapshot.dial_avg_time_nanos as f64 / 1_000_000.0,
+            max_ping_dur_ms: snapshot.dial_avg_time_nanos as f64 / 1_000_000.0,
+            last_connect_time,
+            by_destination: None,
+            by_caller: None,
+        });
+    }
 
     real_time_metrics
         .by_host
@@ -213,7 +297,9 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
 
 #[cfg(test)]
 mod test {
-    use super::MetricType;
+    use super::*;
+    use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+    use std::time::Duration;
 
     #[test]
     fn tes_types() {
@@ -230,5 +316,31 @@ mod test {
 
         let disk = MetricType::new(1 << 1);
         assert!(disk.contains(&MetricType::DISK));
+    }
+
+    #[tokio::test]
+    async fn collect_local_metrics_reports_internode_net_and_rpc() {
+        let metrics = global_internode_metrics();
+        metrics.reset_for_test();
+        metrics.record_sent_bytes(128);
+        metrics.record_recv_bytes(64);
+        metrics.record_outgoing_request();
+        metrics.record_incoming_request();
+        metrics.record_dial_result(Duration::from_millis(4), true);
+
+        let realtime = collect_local_metrics(MetricType::NET, &CollectMetricsOpts::default()).await;
+        let net = realtime.aggregated.net.expect("net metrics");
+        assert_eq!(net.net_stats.tx_bytes, 128);
+        assert_eq!(net.net_stats.rx_bytes, 64);
+
+        let realtime = collect_local_metrics(MetricType::RPC, &CollectMetricsOpts::default()).await;
+        let rpc = realtime.aggregated.rpc.expect("rpc metrics");
+        assert_eq!(rpc.outgoing_bytes, 128);
+        assert_eq!(rpc.incoming_bytes, 64);
+        assert_eq!(rpc.outgoing_messages, 1);
+        assert_eq!(rpc.incoming_messages, 1);
+        assert!(rpc.last_ping_ms > 0.0);
+
+        metrics.reset_for_test();
     }
 }

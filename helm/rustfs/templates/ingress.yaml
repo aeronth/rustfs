@@ -1,23 +1,17 @@
 {{- if .Values.ingress.enabled -}}
-{{- $secretName := .Values.ingress.tls.secretName }}
-{{- $ingressAnnotations := dict }}
-{{- if eq .Values.ingress.className "nginx" }}
-{{- $ingressAnnotations = .Values.ingress.nginxAnnotations }}
-{{- else if eq .Values.ingress.className "" }}
-{{- $ingressAnnotations = .Values.ingress.customAnnotations }}
-{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ include "rustfs.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-  {{- with $ingressAnnotations }}
+  {{- with (include "rustfs.ingressAnnotations" .) }}
   annotations:
-    {{- toYaml . | nindent 4 }}
+    {{- . | nindent 4 }}
   {{- end }}
 spec:
   {{- with .Values.ingress.className }}
@@ -29,7 +23,11 @@ spec:
         {{- range .Values.ingress.hosts }}
         - {{ .host | quote }}
         {{- end }}
-      secretName: {{ $secretName }}
+      {{- if .Values.ingress.tls.existingSecret.enabled }}
+      secretName: {{ required "ingress.tls.existingSecret.name must be set when ingress.tls.existingSecret.enabled is true" .Values.ingress.tls.existingSecret.name }}
+      {{- else }}
+      secretName: {{ include "rustfs.fullname" $ }}-tls
+      {{- end }}
   {{- end }}
   rules:
     {{- range .Values.ingress.hosts }}

@@ -12,19 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
-use tracing::{error, info, instrument, warn};
-
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
     disks_layout::DisksLayout,
     global::global_rustfs_port,
 };
-use std::io::{Error, Result};
+use rustfs_config::{DEFAULT_UNSAFE_BYPASS_DISK_CHECK, ENV_MINIO_CI, ENV_UNSAFE_BYPASS_DISK_CHECK};
+use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
+    io::{Error, ErrorKind, Result},
     net::IpAddr,
 };
+use tracing::{error, info, instrument, warn};
 
 /// enum for setup type.
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -349,6 +349,8 @@ impl PoolEndpointList {
             }
         }
 
+        validate_local_physical_disk_independence(pool_endpoint_list.as_ref())?;
+
         let setup_type = match pool_endpoint_list.as_ref()[0].as_ref()[0].get_type() {
             EndpointType::Path => SetupType::Erasure,
             EndpointType::Url => match unique_args.len() {
@@ -429,7 +431,7 @@ impl PoolEndpointList {
             }
         }
 
-        unimplemented!()
+        Ok(())
     }
 }
 
@@ -555,7 +557,7 @@ impl EndpointServerPools {
 
         for pool in self.0.iter() {
             for ep in pool.endpoints.as_ref() {
-                let n = node_map.entry(ep.host_port()).or_insert(Node {
+                let n = node_map.entry(ep.host_port()).or_insert_with(|| Node {
                     url: ep.url.clone(),
                     pools: vec![],
                     is_local: ep.is_local,
@@ -646,12 +648,152 @@ impl EndpointServerPools {
     }
 }
 
+fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> {
+    let mut local_paths = BTreeSet::new();
+    for endpoints in pools {
+        for endpoint in endpoints.as_ref() {
+            if endpoint.is_local {
+                local_paths.insert(endpoint.get_file_path());
+            }
+        }
+    }
+
+    if local_paths.is_empty() {
+        return Ok(());
+    }
+
+    let local_paths = local_paths.into_iter().collect::<Vec<_>>();
+    validate_local_cross_device_mounts(&local_paths)?;
+
+    if local_paths.len() <= 1 {
+        return Ok(());
+    }
+
+    // Compatibility behavior:
+    // - canonical key: RUSTFS_UNSAFE_BYPASS_DISK_CHECK
+    // - legacy CI alias: MINIO_CI
+    // If both are set, `get_env_bool_with_aliases` keeps canonical key precedence.
+    if rustfs_utils::get_env_bool_with_aliases(ENV_UNSAFE_BYPASS_DISK_CHECK, &[ENV_MINIO_CI], DEFAULT_UNSAFE_BYPASS_DISK_CHECK) {
+        warn!(
+            env = ENV_UNSAFE_BYPASS_DISK_CHECK,
+            local_paths = ?local_paths,
+            "Skipping local physical disk independence validation due to explicit environment override",
+        );
+        return Ok(());
+    }
+
+    let mut device_paths = BTreeMap::<String, BTreeSet<String>>::new();
+    #[cfg(not(windows))]
+    let mut missing_paths = Vec::new();
+
+    for path in &local_paths {
+        let canonical = match rustfs_utils::canonicalize(path) {
+            Ok(path) => path,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                // On Windows, canonicalize can fail for ZFS volumes, junction points,
+                // subst drives, and other non-standard mounts. Try absolutize as fallback.
+                #[cfg(windows)]
+                {
+                    match crate::disk::endpoint::windows_fallback_local_path(path, &err, "disk independence validation") {
+                        Ok(absolute) => {
+                            let abs_path = absolute.to_string_lossy().into_owned();
+                            match rustfs_utils::os::get_physical_device_ids(&abs_path) {
+                                Ok(ids) => {
+                                    for device_id in ids {
+                                        device_paths.entry(device_id).or_default().insert(abs_path.clone());
+                                    }
+                                }
+                                Err(device_err) => {
+                                    return Err(Error::other(format!(
+                                        "failed to inspect physical disk for local endpoint '{abs_path}' after fallback path resolution: {device_err}"
+                                    )));
+                                }
+                            }
+                            continue;
+                        }
+                        Err(fallback_err) => {
+                            return Err(Error::other(format!(
+                                "failed to resolve local endpoint path '{path}' for disk validation: {err}; fallback resolution failed: {fallback_err}"
+                            )));
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    missing_paths.push(path.clone());
+                    continue;
+                }
+            }
+            Err(err) => {
+                return Err(Error::other(format!(
+                    "failed to resolve local endpoint path '{path}' for disk validation: {err}"
+                )));
+            }
+        };
+        let canonical_path = canonical.to_string_lossy().into_owned();
+        let device_ids = rustfs_utils::os::get_physical_device_ids(&canonical_path).map_err(|err| {
+            Error::other(format!("failed to inspect physical disk for local endpoint '{canonical_path}': {err}"))
+        })?;
+
+        for device_id in device_ids {
+            device_paths.entry(device_id).or_default().insert(canonical_path.clone());
+        }
+    }
+
+    #[cfg(not(windows))]
+    if !missing_paths.is_empty() {
+        warn!(
+            missing_paths = ?missing_paths,
+            "Excluding non-existent local endpoint paths from physical disk independence validation during endpoint parsing",
+        );
+    }
+
+    let shared_devices = device_paths
+        .into_iter()
+        .filter_map(|(device_id, paths)| {
+            if paths.len() <= 1 {
+                return None;
+            }
+
+            Some((device_id, paths.into_iter().collect::<Vec<_>>()))
+        })
+        .collect::<Vec<_>>();
+
+    if shared_devices.is_empty() {
+        return Ok(());
+    }
+
+    let details = shared_devices
+        .into_iter()
+        .map(|(device_id, paths)| format!("{device_id} => {}", paths.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    Err(Error::other(format!(
+        "local erasure endpoints must use distinct physical disks; detected shared devices [{details}]. \
+Set {ENV_UNSAFE_BYPASS_DISK_CHECK}=true only for local testing or CI to bypass this safety check"
+    )))
+}
+
+fn validate_local_cross_device_mounts(local_paths: &[String]) -> Result<()> {
+    rustfs_utils::os::check_cross_device_mounts(local_paths)
+        .map_err(|err| Error::other(format!("local endpoint cross-device mount validation failed: {err}")))
+}
+
 #[cfg(test)]
 mod test {
+    use path_absolutize::Absolutize;
     use rustfs_utils::must_get_local_ips;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    use serial_test::serial;
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use temp_env::async_with_vars;
+    #[cfg(target_os = "linux")]
+    use tempfile::tempdir;
 
     #[test]
     fn test_new_endpoints() {
@@ -792,14 +934,17 @@ mod test {
             panic!("No non-loop back IP address found for this host");
         }
         let non_loop_back_ip = non_loop_back_i_ps[0];
+        let remote_ip1 = "192.0.2.10";
+        let remote_ip2 = "192.0.2.11";
+        let remote_ip3 = "192.0.2.12";
 
         let case1_endpoint1 = format!("http://{non_loop_back_ip}/d1");
         let case1_endpoint2 = format!("http://{non_loop_back_ip}/d2");
         let args = vec![
             format!("http://{}:10000/d1", non_loop_back_ip),
             format!("http://{}:10000/d2", non_loop_back_ip),
-            "http://example.org:10000/d3".to_string(),
-            "http://example.com:10000/d4".to_string(),
+            format!("http://{remote_ip1}:10000/d3"),
+            format!("http://{remote_ip2}:10000/d4"),
         ];
         let (case1_ur_ls, case1_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:10000/"));
 
@@ -808,26 +953,26 @@ mod test {
         let args = vec![
             format!("http://{}:10000/d1", non_loop_back_ip),
             format!("http://{}:9000/d2", non_loop_back_ip),
-            "http://example.org:10000/d3".to_string(),
-            "http://example.com:10000/d4".to_string(),
+            format!("http://{remote_ip1}:10000/d3"),
+            format!("http://{remote_ip2}:10000/d4"),
         ];
         let (case2_ur_ls, case2_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:10000/"));
 
         let case3_endpoint1 = format!("http://{non_loop_back_ip}/d1");
         let args = vec![
             format!("http://{}:80/d1", non_loop_back_ip),
-            "http://example.org:9000/d2".to_string(),
-            "http://example.com:80/d3".to_string(),
-            "http://example.net:80/d4".to_string(),
+            format!("http://{remote_ip1}:9000/d2"),
+            format!("http://{remote_ip2}:80/d3"),
+            format!("http://{remote_ip3}:80/d4"),
         ];
         let (case3_ur_ls, case3_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:80/"));
 
         let case4_endpoint1 = format!("http://{non_loop_back_ip}/d1");
         let args = vec![
             format!("http://{}:9000/d1", non_loop_back_ip),
-            "http://example.org:9000/d2".to_string(),
-            "http://example.com:9000/d3".to_string(),
-            "http://example.net:9000/d4".to_string(),
+            format!("http://{remote_ip1}:9000/d2"),
+            format!("http://{remote_ip2}:9000/d3"),
+            format!("http://{remote_ip3}:9000/d4"),
         ];
         let (case4_ur_ls, case4_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:9000/"));
 
@@ -845,8 +990,8 @@ mod test {
 
         let case6_endpoint1 = format!("http://{non_loop_back_ip}:9003/d4");
         let args = vec![
-            "http://localhost:9000/d1".to_string(),
-            "http://localhost:9001/d2".to_string(),
+            "http://127.0.0.1:9000/d1".to_string(),
+            "http://127.0.0.1:9001/d2".to_string(),
             "http://127.0.0.1:9002/d3".to_string(),
             case6_endpoint1.clone(),
         ];
@@ -865,8 +1010,8 @@ mod test {
             // Erasure Single Drive
             TestCase {
                 num: 2,
-                server_addr: "localhost:9000",
-                args: vec!["http://localhost/d1"],
+                server_addr: "127.0.0.1:9000",
+                args: vec!["http://127.0.0.1/d1"],
                 expected_err: Some(Error::other("use path style endpoint for single node setup")),
                 ..Default::default()
             },
@@ -886,7 +1031,7 @@ mod test {
             },
             TestCase {
                 num: 4,
-                server_addr: "localhost:10000",
+                server_addr: "127.0.0.1:10000",
                 args: vec!["/d1"],
                 expected_endpoints: Some(Endpoints(vec![Endpoint {
                     url: must_file_path("/d1"),
@@ -900,12 +1045,12 @@ mod test {
             },
             TestCase {
                 num: 5,
-                server_addr: "localhost:9000",
+                server_addr: "127.0.0.1:9000",
                 args: vec![
                     "https://127.0.0.1:9000/d1",
-                    "https://localhost:9001/d1",
-                    "https://example.com/d1",
-                    "https://example.com/d2",
+                    "https://127.0.0.1:9001/d1",
+                    "https://192.0.2.1/d1",
+                    "https://192.0.2.1/d2",
                 ],
                 expected_err: Some(Error::other("same path '/d1' can not be served by different port on same address")),
                 ..Default::default()
@@ -953,35 +1098,35 @@ mod test {
                 num: 7,
                 server_addr: "0.0.0.0:9000",
                 args: vec![
-                    "http://localhost/d1",
-                    "http://localhost/d2",
-                    "http://localhost/d3",
-                    "http://localhost/d4",
+                    "http://127.0.0.1/d1",
+                    "http://127.0.0.1/d2",
+                    "http://127.0.0.1/d3",
+                    "http://127.0.0.1/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
-                        url: must_url("http://localhost:9000/d1"),
+                        url: must_url("http://127.0.0.1:9000/d1"),
                         is_local: true,
                         pool_idx: 0,
                         set_idx: 0,
                         disk_idx: 0,
                     },
                     Endpoint {
-                        url: must_url("http://localhost:9000/d2"),
+                        url: must_url("http://127.0.0.1:9000/d2"),
                         is_local: true,
                         pool_idx: 0,
                         set_idx: 0,
                         disk_idx: 0,
                     },
                     Endpoint {
-                        url: must_url("http://localhost:9000/d3"),
+                        url: must_url("http://127.0.0.1:9000/d3"),
                         is_local: true,
                         pool_idx: 0,
                         set_idx: 0,
                         disk_idx: 0,
                     },
                     Endpoint {
-                        url: must_url("http://localhost:9000/d4"),
+                        url: must_url("http://127.0.0.1:9000/d4"),
                         is_local: true,
                         pool_idx: 0,
                         set_idx: 0,
@@ -996,8 +1141,8 @@ mod test {
                 num: 8,
                 server_addr: "127.0.0.1:10000",
                 args: vec![
-                    "http://localhost/d1",
-                    "http://localhost/d2",
+                    "http://[::1]/d1",
+                    "http://[::1]/d2",
                     "http://127.0.0.1/d3",
                     "http://127.0.0.1/d4",
                 ],
@@ -1035,8 +1180,8 @@ mod test {
                 args: vec![
                     case1_endpoint1.as_str(),
                     case1_endpoint2.as_str(),
-                    "http://example.org/d3",
-                    "http://example.com/d4",
+                    "http://192.0.2.10/d3",
+                    "http://192.0.2.11/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
@@ -1077,8 +1222,8 @@ mod test {
                 args: vec![
                     case2_endpoint1.as_str(),
                     case2_endpoint2.as_str(),
-                    "http://example.org/d3",
-                    "http://example.com/d4",
+                    "http://192.0.2.10/d3",
+                    "http://192.0.2.11/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
@@ -1118,9 +1263,9 @@ mod test {
                 server_addr: "0.0.0.0:80",
                 args: vec![
                     case3_endpoint1.as_str(),
-                    "http://example.org:9000/d2",
-                    "http://example.com/d3",
-                    "http://example.net/d4",
+                    "http://192.0.2.10:9000/d2",
+                    "http://192.0.2.11/d3",
+                    "http://192.0.2.12/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
@@ -1160,9 +1305,9 @@ mod test {
                 server_addr: "0.0.0.0:9000",
                 args: vec![
                     case4_endpoint1.as_str(),
-                    "http://example.org/d2",
-                    "http://example.com/d3",
-                    "http://example.net/d4",
+                    "http://192.0.2.10/d2",
+                    "http://192.0.2.11/d3",
+                    "http://192.0.2.12/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
@@ -1243,8 +1388,8 @@ mod test {
                 num: 16,
                 server_addr: "0.0.0.0:9003",
                 args: vec![
-                    "http://localhost:9000/d1",
-                    "http://localhost:9001/d2",
+                    "http://127.0.0.1:9000/d1",
+                    "http://127.0.0.1:9001/d2",
                     "http://127.0.0.1:9002/d3",
                     case6_endpoint1.as_str(),
                 ],
@@ -1341,9 +1486,10 @@ mod test {
     }
 
     fn must_file_path(s: impl AsRef<Path>) -> url::Url {
-        let url = url::Url::from_file_path(s.as_ref());
+        let path = s.as_ref().absolutize().expect("absolute test path");
+        let url = url::Url::from_file_path(&path);
 
-        assert!(url.is_ok(), "failed to convert path to URL: {}", s.as_ref().display());
+        assert!(url.is_ok(), "failed to convert path to URL: {}", path.display());
 
         url.unwrap()
     }
@@ -1409,5 +1555,70 @@ mod test {
                 panic!("Test {}: expected failure but passed instead", i + 1);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[serial]
+    #[tokio::test]
+    async fn reject_shared_local_physical_disks_by_default() {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>), (ENV_MINIO_CI, None::<&str>)], async {
+            let dir = tempdir().unwrap();
+            let disk1 = dir.path().join("disk1");
+            let disk2 = dir.path().join("disk2");
+            std::fs::create_dir_all(&disk1).unwrap();
+            std::fs::create_dir_all(&disk2).unwrap();
+
+            let args = vec![disk1.to_string_lossy().into_owned(), disk2.to_string_lossy().into_owned()];
+            let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
+
+            let err = EndpointServerPools::create_server_endpoints("0.0.0.0:9000", &layout)
+                .await
+                .unwrap_err();
+
+            let err_text = err.to_string();
+            assert!(err_text.contains("distinct physical disks"), "unexpected error: {err_text}");
+            assert!(err_text.contains(ENV_UNSAFE_BYPASS_DISK_CHECK), "unexpected error: {err_text}");
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[serial]
+    #[tokio::test]
+    async fn allow_shared_local_physical_disks_with_explicit_env_bypass() {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true"))], async {
+            let dir = tempdir().unwrap();
+            let disk1 = dir.path().join("disk1");
+            let disk2 = dir.path().join("disk2");
+            std::fs::create_dir_all(&disk1).unwrap();
+            std::fs::create_dir_all(&disk2).unwrap();
+
+            let args = vec![disk1.to_string_lossy().into_owned(), disk2.to_string_lossy().into_owned()];
+            let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
+
+            let ret = EndpointServerPools::create_server_endpoints("0.0.0.0:9000", &layout).await;
+            assert!(ret.is_ok(), "expected bypassed disk validation to succeed, got {ret:?}");
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[serial]
+    #[tokio::test]
+    async fn allow_shared_local_physical_disks_with_minio_ci_alias() {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>), (ENV_MINIO_CI, Some("1"))], async {
+            let dir = tempdir().unwrap();
+            let disk1 = dir.path().join("disk1");
+            let disk2 = dir.path().join("disk2");
+            std::fs::create_dir_all(&disk1).unwrap();
+            std::fs::create_dir_all(&disk2).unwrap();
+
+            let args = vec![disk1.to_string_lossy().into_owned(), disk2.to_string_lossy().into_owned()];
+            let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
+
+            let ret = EndpointServerPools::create_server_endpoints("0.0.0.0:9000", &layout).await;
+            assert!(ret.is_ok(), "expected MINIO_CI alias to bypass disk validation, got {ret:?}");
+        })
+        .await;
     }
 }

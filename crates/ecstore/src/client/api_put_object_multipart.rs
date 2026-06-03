@@ -17,8 +17,8 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
 use http::{HeaderMap, HeaderName, StatusCode};
+use hyper::body::Bytes;
 use s3s::S3ErrorCode;
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -127,7 +127,11 @@ impl TransitionClient {
                 let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
-                    custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
+                    if let Ok(header_value) = base64_encode(csum.as_ref()).parse() {
+                        custom_header.insert(header_name, header_value);
+                    } else {
+                        warn!("Failed to parse checksum value");
+                    }
                 } else {
                     warn!("Invalid header name: {}", opts.auto_checksum.key());
                 }
@@ -225,10 +229,15 @@ impl TransitionClient {
         };
 
         let resp = self.execute_method(http::Method::POST, &mut req_metadata).await?;
+
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
         //if resp.is_none() {
         if resp.status() != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(
-                &resp,
+                resp_status,
+                &h,
                 vec![],
                 bucket_name,
                 object_name,
@@ -287,9 +296,14 @@ impl TransitionClient {
         };
 
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
+
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
         if resp.status() != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(
-                &resp,
+                resp_status,
+                &h,
                 vec![],
                 &p.bucket_name.clone(),
                 &p.object_name,
@@ -299,27 +313,27 @@ impl TransitionClient {
         let h = resp.headers();
         let mut obj_part = ObjectPart {
             checksum_crc32: if let Some(h_checksum_crc32) = h.get(ChecksumMode::ChecksumCRC32.key()) {
-                h_checksum_crc32.to_str().expect("err").to_string()
+                h_checksum_crc32.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
             checksum_crc32c: if let Some(h_checksum_crc32c) = h.get(ChecksumMode::ChecksumCRC32C.key()) {
-                h_checksum_crc32c.to_str().expect("err").to_string()
+                h_checksum_crc32c.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
             checksum_sha1: if let Some(h_checksum_sha1) = h.get(ChecksumMode::ChecksumSHA1.key()) {
-                h_checksum_sha1.to_str().expect("err").to_string()
+                h_checksum_sha1.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
             checksum_sha256: if let Some(h_checksum_sha256) = h.get(ChecksumMode::ChecksumSHA256.key()) {
-                h_checksum_sha256.to_str().expect("err").to_string()
+                h_checksum_sha256.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
             checksum_crc64nvme: if let Some(h_checksum_crc64nvme) = h.get(ChecksumMode::ChecksumCRC64NVME.key()) {
-                h_checksum_crc64nvme.to_str().expect("err").to_string()
+                h_checksum_crc64nvme.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
@@ -328,7 +342,7 @@ impl TransitionClient {
         obj_part.size = p.size;
         obj_part.part_num = p.part_number;
         obj_part.etag = if let Some(h_etag) = h.get("ETag") {
-            h_etag.to_str().expect("err").trim_matches('"').to_string()
+            h_etag.to_str().unwrap_or("").trim_matches('"').to_string()
         } else {
             "".to_string()
         };
@@ -370,7 +384,8 @@ impl TransitionClient {
 
         let resp = self.execute_method(http::Method::POST, &mut req_metadata).await?;
 
-        let b = resp.body().bytes().expect("err").to_vec();
+        let h = resp.headers().clone();
+
         let complete_multipart_upload_result: CompleteMultipartUploadResult = CompleteMultipartUploadResult::default();
 
         let (exp_time, rule_id) = if let Some(h_x_amz_expiration) = resp.headers().get(X_AMZ_EXPIRATION) {
@@ -382,13 +397,12 @@ impl TransitionClient {
             (OffsetDateTime::now_utc(), "".to_string())
         };
 
-        let h = resp.headers();
         Ok(UploadInfo {
             bucket: complete_multipart_upload_result.bucket,
             key: complete_multipart_upload_result.key,
             etag: trim_etag(&complete_multipart_upload_result.etag),
             version_id: if let Some(h_x_amz_version_id) = h.get(X_AMZ_VERSION_ID) {
-                h_x_amz_version_id.to_str().expect("err").to_string()
+                h_x_amz_version_id.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },

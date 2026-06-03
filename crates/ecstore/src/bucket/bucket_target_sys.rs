@@ -13,8 +13,18 @@
 // limitations under the License.
 
 use crate::bucket::metadata::BucketMetadata;
+use crate::bucket::metadata_sys::get_bucket_targets_config;
+use crate::bucket::metadata_sys::get_replication_config;
+use crate::bucket::replication::ObjectOpts;
+use crate::bucket::replication::ReplicationConfigurationExt;
+use crate::bucket::target::ARN;
+use crate::bucket::target::BucketTargetType;
+use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
+use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::global::get_global_bucket_monitor;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
@@ -26,20 +36,25 @@ use aws_sdk_s3::types::{
 };
 use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
 use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
+use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, tls as smithy_tls};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use reqwest::Client as HttpClient;
+use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
-    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, RUSTFS_BUCKET_REPLICATION_CHECK,
-    RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, RUSTFS_BUCKET_REPLICATION_REQUEST, RUSTFS_BUCKET_SOURCE_ETAG,
-    RUSTFS_BUCKET_SOURCE_MTIME, RUSTFS_BUCKET_SOURCE_VERSION_ID, RUSTFS_FORCE_DELETE, is_amz_header, is_minio_header,
+    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header, is_minio_header,
     is_rustfs_header, is_standard_header, is_storageclass_header,
+};
+use rustfs_utils::http::{
+    SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -51,15 +66,6 @@ use tracing::error;
 use tracing::warn;
 use url::Url;
 use uuid::Uuid;
-
-use crate::bucket::metadata_sys::get_bucket_targets_config;
-use crate::bucket::metadata_sys::get_replication_config;
-use crate::bucket::replication::ObjectOpts;
-use crate::bucket::replication::ReplicationConfigurationExt;
-use crate::bucket::target::ARN;
-use crate::bucket::target::BucketTargetType;
-use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
-use crate::bucket::versioning_sys::BucketVersioningSys;
 
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
@@ -389,8 +395,27 @@ impl BucketTargetSys {
         }
     }
 
-    pub async fn set_target(&self, bucket: &str, target: &BucketTarget, update: bool) -> Result<(), BucketTargetError> {
-        if !target.target_type.is_valid() && !update {
+    pub async fn set_target(
+        &self,
+        bucket: &str,
+        target: &BucketTarget,
+        update: bool,
+    ) -> Result<BucketTargets, BucketTargetError> {
+        self.validate_target(bucket, target).await?;
+
+        let mut bucket_targets = match self.list_bucket_targets(bucket).await {
+            Ok(targets) => targets,
+            Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => BucketTargets::default(),
+            Err(err) => return Err(err),
+        };
+
+        Self::upsert_target_entry(&mut bucket_targets.targets, target, update)?;
+
+        Ok(bucket_targets)
+    }
+
+    pub async fn validate_target(&self, bucket: &str, target: &BucketTarget) -> Result<(), BucketTargetError> {
+        if !target.target_type.is_valid() {
             return Err(BucketTargetError::BucketRemoteArnTypeInvalid {
                 bucket: bucket.to_string(),
             });
@@ -431,63 +456,57 @@ impl BucketTargetSys {
             let versioning = target_client
                 .get_bucket_versioning(&target.target_bucket)
                 .await
-                .map_err(|_e| BucketTargetError::BucketReplicationSourceNotVersioned {
-                    bucket: bucket.to_string(),
+                .map_err(|e| BucketTargetError::RemoteTargetConnectionErr {
+                    bucket: target.target_bucket.clone(),
+                    access_key: target.credentials.as_ref().map(|c| c.access_key.clone()).unwrap_or_default(),
+                    error: e.to_string(),
                 })?;
 
             if versioning.is_none() {
-                return Err(BucketTargetError::BucketReplicationSourceNotVersioned {
-                    bucket: bucket.to_string(),
+                return Err(BucketTargetError::BucketRemoteTargetNotVersioned {
+                    bucket: target.target_bucket.to_string(),
                 });
             }
         }
 
-        {
-            let mut targets_map = self.targets_map.write().await;
-            let bucket_targets = targets_map.entry(bucket.to_string()).or_insert_with(Vec::new);
-            let mut found = false;
+        Ok(())
+    }
 
-            for (idx, existing_target) in bucket_targets.iter().enumerate() {
-                if existing_target.target_type.to_string() == target.target_type.to_string() {
-                    if existing_target.arn == target.arn {
-                        if !update {
-                            return Err(BucketTargetError::BucketRemoteAlreadyExists {
-                                bucket: existing_target.target_bucket.clone(),
-                            });
-                        }
-                        bucket_targets[idx] = target.clone();
-                        found = true;
-                        break;
-                    }
-                    if existing_target.endpoint == target.endpoint {
+    fn upsert_target_entry(
+        bucket_targets: &mut Vec<BucketTarget>,
+        target: &BucketTarget,
+        update: bool,
+    ) -> Result<(), BucketTargetError> {
+        let mut found = false;
+
+        for (idx, existing_target) in bucket_targets.iter().enumerate() {
+            if existing_target.target_type.to_string() == target.target_type.to_string() {
+                if existing_target.arn == target.arn {
+                    if !update {
                         return Err(BucketTargetError::BucketRemoteAlreadyExists {
                             bucket: existing_target.target_bucket.clone(),
                         });
                     }
+                    bucket_targets[idx] = target.clone();
+                    found = true;
+                    break;
+                }
+                if existing_target.endpoint == target.endpoint {
+                    return Err(BucketTargetError::BucketRemoteAlreadyExists {
+                        bucket: existing_target.target_bucket.clone(),
+                    });
                 }
             }
-
-            if !found && !update {
-                bucket_targets.push(target.clone());
-            }
         }
 
-        {
-            let mut arn_remotes_map = self.arn_remotes_map.write().await;
-            arn_remotes_map.insert(
-                target.arn.clone(),
-                ArnTarget {
-                    client: Some(Arc::new(target_client)),
-                    last_refresh: OffsetDateTime::now_utc(),
-                },
-            );
+        if !found && !update {
+            bucket_targets.push(target.clone());
         }
 
-        self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
         Ok(())
     }
 
-    pub async fn remove_target(&self, bucket: &str, arn_str: &str) -> Result<(), BucketTargetError> {
+    pub async fn remove_target(&self, bucket: &str, arn_str: &str) -> Result<BucketTargets, BucketTargetError> {
         if arn_str.is_empty() {
             return Err(BucketTargetError::BucketRemoteArnInvalid {
                 bucket: bucket.to_string(),
@@ -498,51 +517,34 @@ impl BucketTargetSys {
             bucket: bucket.to_string(),
         })?;
 
-        if arn.arn_type == BucketTargetType::ReplicationService {
-            if let Ok((config, _)) = get_replication_config(bucket).await {
-                for rule in config.filter_target_arns(&ObjectOpts {
-                    op_type: ReplicationType::All,
-                    ..Default::default()
-                }) {
-                    if rule == arn_str || config.role == arn_str {
-                        let arn_remotes_map = self.arn_remotes_map.read().await;
-                        if arn_remotes_map.get(arn_str).is_some() {
-                            return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
-                                bucket: bucket.to_string(),
-                            });
-                        }
+        if arn.arn_type == BucketTargetType::ReplicationService
+            && let Ok((config, _)) = get_replication_config(bucket).await
+        {
+            for rule in config.filter_target_arns(&ObjectOpts {
+                op_type: ReplicationType::All,
+                ..Default::default()
+            }) {
+                if rule == arn_str || config.role == arn_str {
+                    let arn_remotes_map = self.arn_remotes_map.read().await;
+                    if arn_remotes_map.get(arn_str).is_some() {
+                        return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
+                            bucket: bucket.to_string(),
+                        });
                     }
                 }
             }
         }
 
-        {
-            let mut targets_map = self.targets_map.write().await;
+        let targets = self.list_bucket_targets(bucket).await?;
+        let new_targets: Vec<BucketTarget> = targets.targets.iter().filter(|t| t.arn != arn_str).cloned().collect();
 
-            let Some(targets) = targets_map.get(bucket) else {
-                return Err(BucketTargetError::BucketRemoteTargetNotFound {
-                    bucket: bucket.to_string(),
-                });
-            };
-
-            let new_targets: Vec<BucketTarget> = targets.iter().filter(|t| t.arn != arn_str).cloned().collect();
-
-            if new_targets.len() == targets.len() {
-                return Err(BucketTargetError::BucketRemoteTargetNotFound {
-                    bucket: bucket.to_string(),
-                });
-            }
-
-            targets_map.insert(bucket.to_string(), new_targets);
+        if new_targets.len() == targets.targets.len() {
+            return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                bucket: bucket.to_string(),
+            });
         }
 
-        {
-            self.arn_remotes_map.write().await.remove(arn_str);
-        }
-
-        self.update_bandwidth_limit(bucket, arn_str, 0);
-
-        Ok(())
+        Ok(BucketTargets { targets: new_targets })
     }
 
     pub async fn mark_refresh_in_progress(&self, bucket: &str, arn: &str) {
@@ -585,7 +587,7 @@ impl BucketTargetSys {
         };
 
         if let Some(cli) = cli {
-            return Some(cli.clone());
+            return Some(cli);
         }
 
         // TODO: spawn a task to reload the target
@@ -595,7 +597,7 @@ impl BucketTargetSys {
 
         if let Some(last_refresh) = last_refresh {
             let now = OffsetDateTime::now_utc();
-            if now - last_refresh > Duration::from_secs(60 * 5) {
+            if now - last_refresh < Duration::from_secs(60 * 5) {
                 return None;
             }
         }
@@ -610,6 +612,16 @@ impl BucketTargetSys {
                 error!("get bucket targets config error:{}", e);
             }
         };
+
+        let cli = self
+            .arn_remotes_map
+            .read()
+            .await
+            .get(arn)
+            .and_then(|target| target.client.clone());
+        if cli.is_some() {
+            return cli;
+        }
 
         self.inc_arn_errs(bucket, arn).await;
         None
@@ -635,12 +647,23 @@ impl BucketTargetSys {
             format!("http://{}", target.endpoint)
         };
 
-        let config = S3Config::builder()
+        let mut config_builder = S3Config::builder()
             .endpoint_url(endpoint.clone())
             .credentials_provider(SharedCredentialsProvider::new(creds))
             .region(SdkRegion::new(target.region.clone()))
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .build();
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+
+        if should_force_path_style(target) {
+            config_builder = config_builder.force_path_style(true);
+        }
+
+        if target.secure
+            && let Some(http_client) = build_aws_s3_http_client_from_tls_path().await
+        {
+            config_builder = config_builder.http_client(http_client);
+        }
+
+        let config = config_builder.build();
 
         Ok(TargetClient {
             endpoint,
@@ -663,9 +686,19 @@ impl BucketTargetSys {
         Ok(true)
     }
 
-    fn update_bandwidth_limit(&self, _bucket: &str, _arn: &str, _limit: i64) {
-        // Implementation for bandwidth limit update
-        // This would interact with the global bucket monitor
+    fn update_bandwidth_limit(&self, bucket: &str, arn: &str, limit: i64) {
+        if let Some(bucket_monitor) = get_global_bucket_monitor() {
+            if limit == 0 {
+                bucket_monitor.delete_bucket_throttle(bucket, arn);
+                return;
+            }
+            bucket_monitor.set_bandwidth_limit(bucket, arn, limit);
+        } else {
+            error!(
+                "Global bucket monitor uninitialized; skipping bandwidth limit update for bucket '{}' and ARN '{}'",
+                bucket, arn
+            );
+        }
     }
 
     pub async fn get_remote_target_client_by_arn(&self, _bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
@@ -687,26 +720,27 @@ impl BucketTargetSys {
         if let Some(existing_targets) = targets_map.remove(bucket) {
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
+                self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
 
         // Add new targets
-        if let Some(new_targets) = targets {
-            if !new_targets.is_empty() {
-                for target in &new_targets.targets {
-                    if let Ok(client) = self.get_remote_target_client_internal(target).await {
-                        arn_remotes_map.insert(
-                            target.arn.clone(),
-                            ArnTarget {
-                                client: Some(Arc::new(client)),
-                                last_refresh: OffsetDateTime::now_utc(),
-                            },
-                        );
-                        self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
-                    }
+        if let Some(new_targets) = targets
+            && !new_targets.is_empty()
+        {
+            for target in &new_targets.targets {
+                if let Ok(client) = self.get_remote_target_client_internal(target).await {
+                    arn_remotes_map.insert(
+                        target.arn.clone(),
+                        ArnTarget {
+                            client: Some(Arc::new(client)),
+                            last_refresh: OffsetDateTime::now_utc(),
+                        },
+                    );
+                    self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
                 }
-                targets_map.insert(bucket.to_string(), new_targets.targets.clone());
             }
+            targets_map.insert(bucket.to_string(), new_targets.targets.clone());
         }
     }
 
@@ -756,7 +790,10 @@ impl BucketTargetSys {
                         && tgt
                             .credentials
                             .as_ref()
-                            .map(|c| c.access_key == target.credentials.as_ref().unwrap_or(&Credentials::default()).access_key)
+                            .map(|c| {
+                                let default_creds = Credentials::default();
+                                c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
+                            })
                             .unwrap_or(false)
                     {
                         return (tgt.arn.clone(), true);
@@ -770,6 +807,71 @@ impl BucketTargetSys {
         }
         let arn = generate_arn(target, depl_id);
         (arn, false)
+    }
+}
+
+async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::SharedHttpClient> {
+    let tls_path = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
+    if tls_path.is_empty() {
+        return None;
+    }
+
+    let tls_dir = Path::new(&tls_path);
+    let mut trust_store = smithy_tls::TrustStore::default();
+    let mut has_custom_certs = false;
+
+    let ca_path = tls_dir.join(RUSTFS_CA_CERT);
+    match tokio::fs::read(&ca_path).await {
+        Ok(pem) => {
+            trust_store.add_pem_certificate(pem);
+            has_custom_certs = true;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("failed to read custom CA bundle {:?} for replication client: {}", ca_path, e),
+    }
+
+    if rustfs_utils::get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA) {
+        let leaf_cert_path = tls_dir.join(RUSTFS_TLS_CERT);
+        match tokio::fs::read(&leaf_cert_path).await {
+            Ok(pem) => {
+                trust_store.add_pem_certificate(pem);
+                has_custom_certs = true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("failed to read leaf cert {:?} for replication client trust store: {}", leaf_cert_path, e),
+        }
+    }
+
+    if !has_custom_certs {
+        return None;
+    }
+
+    let tls_context = match smithy_tls::TlsContext::builder().with_trust_store(trust_store).build() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            warn!("failed to build AWS SDK TLS context for replication client: {}", e);
+            return None;
+        }
+    };
+
+    Some(
+        SmithyHttpClientBuilder::new()
+            .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
+            .tls_context(tls_context)
+            .build_https(),
+    )
+}
+
+fn should_force_path_style(target: &BucketTarget) -> bool {
+    match target.path.trim().to_ascii_lowercase().as_str() {
+        // Explicit DNS/virtual-hosted-style requested by user.
+        "dns" | "off" | "false" => false,
+        // Explicit path-style or legacy boolean-like values.
+        "path" | "on" | "true" => true,
+        // `auto` and empty are defaulted to path-style for custom S3-compatible endpoints.
+        "auto" | "" => true,
+        // Unknown values: prefer compatibility with S3-compatible services.
+        _ => true,
     }
 }
 
@@ -797,6 +899,41 @@ pub struct RemoveObjectOptions {
     pub replication_status: ReplicationStatusType,
     pub replication_request: bool,
     pub replication_validity_check: bool,
+}
+
+fn build_remove_object_headers(version_id: Option<&str>, opts: &RemoveObjectOptions) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if opts.force_delete {
+        insert_header(&mut headers, SUFFIX_FORCE_DELETE, "true");
+    }
+    if opts.governance_bypass {
+        headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
+    }
+
+    if opts.replication_delete_marker {
+        insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
+    }
+
+    if let Some(t) = opts.replication_mtime {
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, t.format(&Rfc3339).unwrap_or_default());
+    }
+
+    if !opts.replication_status.is_empty() {
+        headers.insert(AMZ_BUCKET_REPLICATION_STATUS, opts.replication_status.as_str().parse().unwrap());
+    }
+
+    if let Some(version_id) = version_id {
+        insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, version_id);
+    }
+
+    if opts.replication_request {
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+    }
+    if opts.replication_validity_check {
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
+    }
+
+    headers
 }
 
 #[derive(Debug, Clone)]
@@ -986,19 +1123,21 @@ impl PutObjectOptions {
         }
 
         if !self.internal.source_version_id.is_empty() {
-            header.insert(
-                RUSTFS_BUCKET_SOURCE_VERSION_ID,
-                HeaderValue::from_str(&self.internal.source_version_id).expect("err"),
-            );
+            insert_header(&mut header, SUFFIX_SOURCE_VERSION_ID, &self.internal.source_version_id);
         }
         if self.internal.source_etag.is_empty() {
-            header.insert(RUSTFS_BUCKET_SOURCE_ETAG, HeaderValue::from_str(&self.internal.source_etag).expect("err"));
+            insert_header(&mut header, SUFFIX_SOURCE_ETAG, &self.internal.source_etag);
         }
         if self.internal.source_mtime.unix_timestamp() != 0 {
-            header.insert(
-                RUSTFS_BUCKET_SOURCE_MTIME,
-                HeaderValue::from_str(&self.internal.source_mtime.unix_timestamp().to_string()).expect("err"),
+            insert_header(
+                &mut header,
+                SUFFIX_SOURCE_MTIME,
+                self.internal.source_mtime.format(&Rfc3339).unwrap_or_default(),
             );
+        }
+
+        if self.internal.replication_request {
+            insert_header(&mut header, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
 
         header
@@ -1037,11 +1176,20 @@ pub struct S3ClientError {
 }
 impl S3ClientError {
     pub fn new(value: impl Into<String>) -> Self {
+        Self::with_metadata(value, None, None, None)
+    }
+
+    pub fn with_metadata(
+        error: impl Into<String>,
+        status_code: Option<StatusCode>,
+        code: Option<String>,
+        message: Option<String>,
+    ) -> Self {
         S3ClientError {
-            error: value.into(),
-            status_code: None,
-            code: None,
-            message: None,
+            error: error.into(),
+            status_code,
+            code,
+            message,
         }
     }
 
@@ -1057,16 +1205,16 @@ impl S3ClientError {
 
 impl<T: aws_sdk_s3::error::ProvideErrorMetadata> From<T> for S3ClientError {
     fn from(value: T) -> Self {
-        S3ClientError {
-            error: format!(
-                "{}: {}",
-                value.code().map(String::from).unwrap_or("unknown code".into()),
-                value.message().map(String::from).unwrap_or("missing reason".into()),
-            ),
-            status_code: None,
-            code: None,
-            message: None,
-        }
+        let code = value.code().map(String::from);
+        let message = value.message().map(String::from);
+        let error = match (code.as_deref(), message.as_deref()) {
+            (Some(code), Some(message)) => format!("{code}: {message}"),
+            (Some(code), None) => code.to_string(),
+            (None, Some(message)) => message.to_string(),
+            (None, None) => "unknown remote error".to_string(),
+        };
+
+        S3ClientError::with_metadata(error, None, code, message)
     }
 }
 
@@ -1095,8 +1243,7 @@ pub struct TargetClient {
 
 impl TargetClient {
     pub fn to_url(&self) -> Url {
-        let scheme = if self.secure { "https" } else { "http" };
-        Url::parse(&format!("{scheme}://{}", self.endpoint)).unwrap()
+        Url::parse(&self.endpoint).unwrap()
     }
 
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, S3ClientError> {
@@ -1105,9 +1252,22 @@ impl TargetClient {
             Err(e) => match e {
                 SdkError::ServiceError(oe) => match oe.into_err() {
                     HeadBucketError::NotFound(_) => Ok(false),
-                    other => Err(S3ClientError::new(format!(
-                        "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{other:?}"
-                    ))),
+                    other => {
+                        warn!(
+                            "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{:?}",
+                            other
+                        );
+                        let message = other.meta().meta();
+                        Err(S3ClientError::with_metadata(
+                            format!(
+                                "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{:?}",
+                                message
+                            ),
+                            None,
+                            message.code().map(ToOwned::to_owned),
+                            message.message().map(ToOwned::to_owned),
+                        ))
+                    }
                 },
                 SdkError::DispatchFailure(e) => Err(S3ClientError::new(format!(
                     "failed to dispatch bucket exists for bucket:{bucket} error:{e:?}"
@@ -1155,9 +1315,14 @@ impl TargetClient {
         body: ByteStream,
         opts: &PutObjectOptions,
     ) -> Result<(), S3ClientError> {
-        let headers = opts.header();
+        let mut headers = opts.header();
 
         let builder = self.client.put_object();
+
+        let version_id = opts.internal.source_version_id.clone();
+        if !version_id.is_empty() {
+            insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
+        }
 
         match builder
             .bucket(bucket)
@@ -1186,9 +1351,34 @@ impl TargetClient {
         &self,
         bucket: &str,
         object: &str,
-        _opts: &PutObjectOptions,
+        opts: &PutObjectOptions,
     ) -> Result<String, S3ClientError> {
-        match self.client.create_multipart_upload().bucket(bucket).key(object).send().await {
+        let mut headers = HeaderMap::new();
+        let version_id = opts.internal.source_version_id.clone();
+        if !version_id.is_empty() {
+            insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
+        }
+        if opts.internal.replication_request {
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        }
+
+        match self
+            .client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(object)
+            .customize()
+            .map_request(move |mut req| {
+                for (k, v) in headers.clone().into_iter() {
+                    let key_str = k.unwrap().as_str().to_string();
+                    let value_str = v.to_str().unwrap_or("").to_string();
+                    req.headers_mut().insert(key_str, value_str);
+                }
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+        {
             Ok(res) => Ok(res.upload_id.unwrap_or_default()),
             Err(e) => Err(e.into()),
         }
@@ -1276,42 +1466,15 @@ impl TargetClient {
         version_id: Option<String>,
         opts: RemoveObjectOptions,
     ) -> Result<(), S3ClientError> {
-        let mut headers = HeaderMap::new();
-        if opts.force_delete {
-            headers.insert(RUSTFS_FORCE_DELETE, "true".parse().unwrap());
-        }
-        if opts.governance_bypass {
-            headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
-        }
-
-        if opts.replication_delete_marker {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, "true".parse().unwrap());
-        }
-
-        if let Some(t) = opts.replication_mtime {
-            headers.insert(
-                RUSTFS_BUCKET_SOURCE_MTIME,
-                t.format(&Rfc3339).unwrap_or_default().as_str().parse().unwrap(),
-            );
-        }
-
-        if !opts.replication_status.is_empty() {
-            headers.insert(AMZ_BUCKET_REPLICATION_STATUS, opts.replication_status.as_str().parse().unwrap());
-        }
-
-        if opts.replication_request {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, "true".parse().unwrap());
-        }
-        if opts.replication_validity_check {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_CHECK, "true".parse().unwrap());
-        }
+        let headers = build_remove_object_headers(version_id.as_deref(), &opts);
+        let api_version_id = if opts.replication_request { None } else { version_id };
 
         match self
             .client
             .delete_object()
             .bucket(bucket)
             .key(object)
-            .set_version_id(version_id)
+            .set_version_id(api_version_id)
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
@@ -1405,3 +1568,53 @@ impl From<std::io::Error> for BucketTargetError {
 }
 
 impl Error for BucketTargetError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_remove_object_headers_includes_internal_version_id_for_replication_delete() {
+        let version_id = Uuid::new_v4().to_string();
+        let headers = build_remove_object_headers(
+            Some(version_id.as_str()),
+            &RemoveObjectOptions {
+                force_delete: false,
+                governance_bypass: false,
+                replication_delete_marker: true,
+                replication_mtime: None,
+                replication_status: ReplicationStatusType::Replica,
+                replication_request: true,
+                replication_validity_check: false,
+            },
+        );
+
+        assert_eq!(
+            rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_VERSION_ID).as_deref(),
+            Some(version_id.as_str()),
+            "replication delete requests must preserve the version id in internal headers"
+        );
+    }
+
+    #[test]
+    fn build_remove_object_headers_omits_delete_marker_flag_for_marker_version_purge() {
+        let version_id = Uuid::new_v4().to_string();
+        let headers = build_remove_object_headers(
+            Some(version_id.as_str()),
+            &RemoveObjectOptions {
+                force_delete: false,
+                governance_bypass: false,
+                replication_delete_marker: false,
+                replication_mtime: None,
+                replication_status: ReplicationStatusType::Replica,
+                replication_request: true,
+                replication_validity_check: false,
+            },
+        );
+
+        assert!(
+            rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_DELETEMARKER).is_none(),
+            "delete-marker version purges must not masquerade as delete-marker creations"
+        );
+    }
+}

@@ -42,6 +42,8 @@ jobs:
     name: Performance Profiling
     runs-on: ubicloud-standard-2
     timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -84,7 +86,7 @@ jobs:
 
       - name: Build with profiling optimizations
         run: |
-          RUSTFLAGS="-C force-frame-pointers=yes -C debug-assertions=off" \
+          RUSTFLAGS="-C force-frame-pointers=yes -C debug-assertions=off --cfg tokio_unstable" \
           cargo +nightly build --profile profiling -p rustfs --bins
 
       - name: Run performance profiling
@@ -107,7 +109,7 @@ jobs:
 
       - name: Upload profile data
         if: steps.profiling.outputs.profile_generated == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: performance-profile-${{ github.run_number }}
           path: samply-profile.json
@@ -117,6 +119,8 @@ jobs:
     name: Benchmark Tests
     runs-on: ubicloud-standard-2
     timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -135,7 +139,7 @@ jobs:
           tee benchmark-results.json
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results-${{ github.run_number }}
           path: benchmark-results.json

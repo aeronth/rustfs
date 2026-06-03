@@ -12,124 +12,223 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
-};
-
-use bytes::Bytes;
-use futures::lock::Mutex;
-use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
-use rustfs_protos::{
-    node_service_time_out_client,
-    proto_gen::node_service::{
-        CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
-        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
-        ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
-        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    },
-};
-use rustfs_utils::string::parse_bool_with_default;
-use tokio::time;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
-
+use crate::disk::error::{Error, Result};
 use crate::disk::{
-    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
+    FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     disk_store::{
-        CHECK_EVERY, CHECK_TIMEOUT_DURATION, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE, get_max_timeout_duration,
+        DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
+        get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
+        get_drive_metadata_timeout, get_drive_walkdir_stall_timeout, get_drive_walkdir_timeout, get_max_timeout_duration,
     },
     endpoint::Endpoint,
+    health_state::{RuntimeDriveHealthState, get_drive_returning_probe_interval, record_drive_runtime_state},
 };
-use crate::disk::{FileReader, FileWriter};
-use crate::disk::{disk_store::DiskHealthTracker, error::DiskError};
-use crate::{
-    disk::error::{Error, Result},
-    rpc::build_auth_headers,
+use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
+use crate::rpc::client::{
+    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
 };
+use crate::rpc::internode_data_transport::{InternodeDataTransport, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest};
+use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
+use bytes::Bytes;
+use futures::lock::Mutex;
+use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    global_internode_metrics,
+};
+use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
-use rustfs_rio::{HttpReader, HttpWriter};
-use tokio::{io::AsyncWrite, net::TcpStream, time::timeout};
-use tonic::Request;
+use rustfs_protos::proto_gen::node_service::{
+    CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
+    DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
+    ReadMetadataRequest, ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
+    RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+    node_service_client::NodeServiceClient,
+};
+use serde::{Serialize, de::DeserializeOwned};
+use std::{
+    io::Cursor,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
+use tokio::time;
+use tokio::{
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+    time::timeout,
+};
+use tokio_util::sync::CancellationToken;
+use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureHealthAction {
+    MarkFailure,
+    IgnoreFailure,
+}
+
+async fn copy_stream_with_buffer<R, W>(reader: &mut R, writer: &mut W, buffer_size: usize) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; buffer_size];
+
+    loop {
+        let bytes_read = reader.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            writer.flush().await?;
+            return Ok(copied);
+        }
+
+        writer.write_all(&buffer[..bytes_read]).await?;
+        copied += bytes_read as u64;
+    }
+}
 
 #[derive(Debug)]
 pub struct RemoteDisk {
     pub id: Mutex<Option<Uuid>>,
     pub addr: String,
-    pub url: url::Url,
-    pub root: PathBuf,
     endpoint: Endpoint,
+    pub scanning: Arc<AtomicU32>,
     /// Whether health checking is enabled
     health_check: bool,
     /// Health tracker for connection monitoring
     health: Arc<DiskHealthTracker>,
     /// Cancellation token for monitoring tasks
     cancel_token: CancellationToken,
+    data_transport: Arc<dyn InternodeDataTransport>,
 }
 
 impl RemoteDisk {
-    pub async fn new(ep: &Endpoint, opt: &DiskOption) -> Result<Self> {
-        // let root = fs::canonicalize(ep.url.path()).await?;
-        let root = PathBuf::from(ep.get_file_path());
+    fn is_retryable_walk_dir_error(err: &DiskError) -> bool {
+        if is_network_like_disk_error(err) {
+            return true;
+        }
+
+        let err_text = err.to_string().to_ascii_lowercase();
+        err_text.contains("httpreader stream error") || err_text.contains("error decoding response body")
+    }
+
+    pub(crate) async fn new(ep: &Endpoint, opt: &DiskOption, data_transport: Arc<dyn InternodeDataTransport>) -> Result<Self> {
         let addr = if let Some(port) = ep.url.port() {
             format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), port)
         } else {
             format!("{}://{}", ep.url.scheme(), ep.url.host_str().unwrap())
         };
 
-        let env_health_check = std::env::var(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING)
-            .map(|v| parse_bool_with_default(&v, true))
-            .unwrap_or(true);
+        let env_health_check =
+            rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
 
         let disk = Self {
             id: Mutex::new(None),
-            addr: addr.clone(),
-            url: ep.url.clone(),
-            root,
+            addr,
             endpoint: ep.clone(),
+            scanning: Arc::new(AtomicU32::new(0)),
             health_check: opt.health_check && env_health_check,
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
+            data_transport,
         };
-
-        // Start health monitoring
-        disk.start_health_monitoring();
+        record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
         Ok(disk)
     }
 
-    /// Start health monitoring for the remote disk
-    fn start_health_monitoring(&self) {
-        if self.health_check {
-            let health = Arc::clone(&self.health);
-            let cancel_token = self.cancel_token.clone();
-            let addr = self.addr.clone();
+    pub fn runtime_state(&self) -> RuntimeDriveHealthState {
+        self.health.runtime_state()
+    }
 
-            tokio::spawn(async move {
-                Self::monitor_remote_disk_health(addr, health, cancel_token).await;
-            });
+    pub fn offline_duration_secs(&self) -> Option<u64> {
+        self.health.offline_duration().map(|duration| duration.as_secs())
+    }
+
+    pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
+        self.health.last_capacity_snapshot()
+    }
+
+    pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
+        self.health.record_capacity_probe(total, used, free);
+    }
+
+    #[cfg(test)]
+    pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
+        self.health.force_runtime_state_for_test(state);
+    }
+
+    /// Same as [`DiskHealthTracker::reset_for_store_init_retry`]: undo a transient faulty mark before another format load attempt.
+    pub fn reset_health_for_store_init_retry(&self) {
+        self.health.reset_for_store_init_retry(&self.endpoint);
+    }
+
+    fn spawn_recovery_monitor_if_needed(&self) {
+        if !self.health_check {
+            return;
         }
+
+        let addr = self.addr.clone();
+        let endpoint = self.endpoint.clone();
+        let health = Arc::clone(&self.health);
+        let cancel_token = self.cancel_token.clone();
+        tokio::spawn(async move {
+            Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
+        });
+    }
+
+    fn mark_suspect_or_offline(&self, reason: &'static str) -> bool {
+        self.health.mark_failure(&self.endpoint, reason)
+    }
+
+    /// Enable health monitoring after disk creation.
+    /// Used to defer health checks until after startup format loading completes,
+    /// so that remote peers have time to come online.
+    pub fn enable_health_check(&self) {
+        if !self.health_check {
+            return;
+        }
+        let health = Arc::clone(&self.health);
+        let cancel_token = self.cancel_token.clone();
+        let addr = self.addr.clone();
+        let endpoint = self.endpoint.clone();
+
+        tokio::spawn(async move {
+            Self::monitor_remote_disk_health(addr, endpoint, health, cancel_token).await;
+        });
     }
 
     /// Monitor remote disk health periodically
-    async fn monitor_remote_disk_health(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
-        let mut interval = time::interval(CHECK_EVERY);
+    async fn monitor_remote_disk_health(
+        addr: String,
+        endpoint: Endpoint,
+        health: Arc<DiskHealthTracker>,
+        cancel_token: CancellationToken,
+    ) {
+        let mut interval = time::interval(get_drive_active_check_interval());
 
         // Perform basic connectivity check
-        if Self::perform_connectivity_check(&addr).await.is_err() && health.swap_ok_to_faulty() {
+        let initial_probe_ok = Self::perform_connectivity_check(&addr).await.is_ok();
+        if initial_probe_ok {
+            health.record_operation_success(&endpoint, "connectivity_probe_success");
+        } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
             warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
             // Start recovery monitoring
             let health_clone = Arc::clone(&health);
             let addr_clone = addr.clone();
+            let endpoint_clone = endpoint.clone();
             let cancel_clone = cancel_token.clone();
 
             tokio::spawn(async move {
-                Self::monitor_remote_disk_recovery(addr_clone, health_clone, cancel_clone).await;
+                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
             });
         }
 
@@ -162,16 +261,19 @@ impl RemoteDisk {
                     }
 
                     // Perform basic connectivity check
-                    if Self::perform_connectivity_check(&addr).await.is_err() && health.swap_ok_to_faulty() {
+                    if Self::perform_connectivity_check(&addr).await.is_ok() {
+                        health.record_operation_success(&endpoint, "connectivity_probe_success");
+                    } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
                         warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
                         // Start recovery monitoring
                         let health_clone = Arc::clone(&health);
                         let addr_clone = addr.clone();
+                        let endpoint_clone = endpoint.clone();
                         let cancel_clone = cancel_token.clone();
 
                         tokio::spawn(async move {
-                            Self::monitor_remote_disk_recovery(addr_clone, health_clone, cancel_clone).await;
+                            Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
                         });
                     }
                 }
@@ -180,8 +282,13 @@ impl RemoteDisk {
     }
 
     /// Monitor remote disk recovery and mark as healthy when recovered
-    async fn monitor_remote_disk_recovery(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
-        let mut interval = time::interval(CHECK_EVERY);
+    async fn monitor_remote_disk_recovery(
+        addr: String,
+        endpoint: Endpoint,
+        health: Arc<DiskHealthTracker>,
+        cancel_token: CancellationToken,
+    ) {
+        let mut interval = time::interval(get_drive_returning_probe_interval());
 
         loop {
             tokio::select! {
@@ -190,9 +297,14 @@ impl RemoteDisk {
                 }
                 _ = interval.tick() => {
                     if Self::perform_connectivity_check(&addr).await.is_ok() {
-                        info!("Remote disk recovered: {}", addr);
-                        health.set_ok();
-                        return;
+                        let became_online = health.mark_recovery_success(&endpoint, "connectivity_probe_success");
+                        info!("Remote disk recovery probe succeeded: {}", addr);
+                        if became_online {
+                            info!("Remote disk recovered: {}", addr);
+                            return;
+                        }
+                    } else {
+                        health.mark_failure(&endpoint, "connectivity_probe_failed");
                     }
                 }
             }
@@ -201,7 +313,7 @@ impl RemoteDisk {
 
     /// Perform basic connectivity check for remote disk
     async fn perform_connectivity_check(addr: &str) -> Result<()> {
-        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {}", e)))?;
+        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {e}")))?;
 
         let Some(host) = url.host_str() else {
             return Err(Error::other("No host in URL".to_string()));
@@ -210,12 +322,12 @@ impl RemoteDisk {
         let port = url.port_or_known_default().unwrap_or(80);
 
         // Try to establish TCP connection
-        match timeout(CHECK_TIMEOUT_DURATION, TcpStream::connect((host, port))).await {
+        match timeout(get_drive_active_check_timeout(), TcpStream::connect((host, port))).await {
             Ok(Ok(stream)) => {
                 drop(stream);
                 Ok(())
             }
-            _ => Err(Error::other(format!("Cannot connect to {}:{}", host, port))),
+            _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
         }
     }
 
@@ -225,9 +337,37 @@ impl RemoteDisk {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.execute_with_timeout_for_op("unknown", operation, timeout_duration).await
+    }
+
+    async fn execute_with_timeout_for_op<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.execute_with_timeout_for_op_and_health_action(op, operation, timeout_duration, FailureHealthAction::MarkFailure)
+            .await
+    }
+
+    async fn execute_with_timeout_for_op_and_health_action<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+        failure_health_action: FailureHealthAction,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         // Check if disk is faulty
         if self.health.is_faulty() {
-            warn!("disk {} health is faulty, returning error", self.to_string());
+            warn!("remote disk {} health is faulty, returning error", self.to_string());
             return Err(DiskError::FaultyDisk);
         }
 
@@ -239,6 +379,17 @@ impl RemoteDisk {
         self.health.last_started.store(now, std::sync::atomic::Ordering::Relaxed);
         self.health.increment_waiting();
 
+        if timeout_duration == Duration::ZERO {
+            let operation_result = operation().await;
+            if operation_result.is_ok() {
+                self.health.log_success();
+            }
+            self.health.decrement_waiting();
+            self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
+                .await;
+            return operation_result;
+        }
+
         // Execute operation with timeout
         let result = time::timeout(timeout_duration, operation()).await;
 
@@ -249,16 +400,129 @@ impl RemoteDisk {
                     self.health.log_success();
                 }
                 self.health.decrement_waiting();
+                self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
+                    .await;
                 operation_result
             }
             Err(_) => {
                 // Timeout occurred, mark disk as potentially faulty
                 self.health.decrement_waiting();
-                warn!("Remote disk operation timeout after {:?}", timeout_duration);
-                Err(Error::other(format!("Remote disk operation timeout after {:?}", timeout_duration)))
+                counter!(
+                    "rustfs_drive_op_timeout_total",
+                    "endpoint" => self.endpoint.to_string(),
+                    "op" => op.to_string()
+                )
+                .increment(1);
+                if failure_health_action == FailureHealthAction::MarkFailure {
+                    self.mark_faulty_and_evict("operation_timeout").await;
+                }
+                warn!(
+                    endpoint = %self.endpoint,
+                    addr = %self.addr,
+                    op,
+                    timeout_ms = timeout_duration.as_millis(),
+                    "Remote disk operation timed out"
+                );
+                Err(DiskError::Timeout)
             }
         }
     }
+
+    async fn handle_network_like_error<T>(
+        &self,
+        op: &'static str,
+        timeout_duration: Duration,
+        operation_result: &Result<T>,
+        failure_health_action: FailureHealthAction,
+    ) {
+        if let Err(err) = operation_result
+            && is_network_like_disk_error(err)
+        {
+            counter!(
+                "rustfs_drive_op_network_error_total",
+                "endpoint" => self.endpoint.to_string(),
+                "op" => op.to_string()
+            )
+            .increment(1);
+            warn!(
+                endpoint = %self.endpoint,
+                addr = %self.addr,
+                op,
+                timeout_ms = timeout_duration.as_millis(),
+                "Remote disk operation returned a network-like error"
+            );
+            if failure_health_action == FailureHealthAction::MarkFailure {
+                self.mark_faulty_and_evict("operation_network_error").await;
+            }
+        }
+    }
+
+    async fn mark_faulty_and_evict(&self, reason: &'static str) {
+        let previous_state = self.runtime_state();
+        let transitioned_to_offline = self.mark_suspect_or_offline(reason);
+        let state = self.runtime_state();
+
+        if state != previous_state {
+            self.spawn_recovery_monitor_if_needed();
+            counter!(
+                "rustfs_drive_faulty_mark_total",
+                "endpoint" => self.endpoint.to_string(),
+                "reason" => reason.to_string()
+            )
+            .increment(1);
+            if transitioned_to_offline {
+                warn!(
+                    "Remote disk marked faulty after timeout: endpoint={}, addr={}, reason={}",
+                    self.endpoint, self.addr, reason
+                );
+            } else {
+                warn!(
+                    "Remote disk marked suspect after timeout: endpoint={}, addr={}, reason={}, state={:?}",
+                    self.endpoint, self.addr, reason, state
+                );
+            }
+            counter!(
+                "rustfs_drive_connection_evict_total",
+                "endpoint" => self.endpoint.to_string(),
+                "reason" => reason.to_string()
+            )
+            .increment(1);
+            info!(
+                endpoint = %self.endpoint,
+                addr = %self.addr,
+                reason,
+                "Evicting cached remote disk connection after fault transition"
+            );
+            evict_failed_connection(&self.addr).await;
+        }
+    }
+
+    async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+            .await
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+    }
+
+    async fn disk_ref(&self) -> String {
+        (*self.id.lock().await)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| self.endpoint.to_string())
+    }
+}
+
+fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::new());
+    value.serialize(&mut serializer)?;
+    Ok(serializer.into_inner())
+}
+
+fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str) -> Result<T> {
+    if !binary.is_empty() {
+        let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
+        return T::deserialize(&mut deserializer).map_err(Error::from);
+    }
+
+    serde_json::from_str(json).map_err(Error::from)
 }
 
 // TODO: all api need to handle errors
@@ -307,7 +571,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     fn path(&self) -> PathBuf {
-        self.root.clone()
+        PathBuf::from(self.endpoint.get_file_path())
     }
 
     #[tracing::instrument(skip(self))]
@@ -343,7 +607,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(MakeVolumeRequest {
@@ -370,7 +635,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(MakeVolumesRequest {
@@ -397,7 +663,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ListVolumesRequest {
@@ -429,7 +696,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(StatVolumeRequest {
@@ -458,7 +726,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(DeleteVolumeRequest {
@@ -545,7 +814,8 @@ impl DiskAPI for RemoteDisk {
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
 
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(DeleteVersionRequest {
@@ -603,7 +873,7 @@ impl DiskAPI for RemoteDisk {
                 }
             });
         }
-        let mut client = match node_service_time_out_client(&self.addr).await {
+        let mut client = match self.get_client().await {
             Ok(client) => client,
             Err(err) => {
                 let mut errors = Vec::with_capacity(versions.len());
@@ -674,7 +944,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(DeletePathsRequest {
@@ -700,17 +971,22 @@ impl DiskAPI for RemoteDisk {
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         info!("write_metadata {}/{}", volume, path);
         let file_info = serde_json::to_string(&fi)?;
+        let file_info_bin = encode_msgpack(&fi)?;
 
-        self.execute_with_timeout(
-            || async {
-                let mut client = node_service_time_out_client(&self.addr)
+        self.execute_with_timeout_for_op(
+            "write_metadata",
+            move || async move {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(WriteMetadataRequest {
-                    disk: self.endpoint.to_string(),
+                    disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
-                    file_info: file_info.clone(),
+                    file_info,
+                    file_info_bin: file_info_bin.into(),
                 });
 
                 let response = client.write_metadata(request).await?.into_inner();
@@ -726,23 +1002,58 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        self.execute_with_timeout_for_op(
+            "read_metadata",
+            || async {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(ReadMetadataRequest {
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    disk,
+                });
+
+                let response = client.read_metadata(request).await?.into_inner();
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(response.data)
+            },
+            get_drive_metadata_timeout(),
+        )
+        .await
+    }
+
     #[tracing::instrument(skip(self))]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         info!("update_metadata");
         let file_info = serde_json::to_string(&fi)?;
         let opts_str = serde_json::to_string(&opts)?;
+        let file_info_bin = encode_msgpack(&fi)?;
+        let opts_bin = encode_msgpack(opts)?;
 
-        self.execute_with_timeout(
-            || async {
-                let mut client = node_service_time_out_client(&self.addr)
+        self.execute_with_timeout_for_op(
+            "update_metadata",
+            move || async move {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(UpdateMetadataRequest {
-                    disk: self.endpoint.to_string(),
+                    disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
-                    file_info: file_info.clone(),
-                    opts: opts_str.clone(),
+                    file_info,
+                    opts: opts_str,
+                    file_info_bin: file_info_bin.into(),
+                    opts_bin: opts_bin.into(),
                 });
 
                 let response = client.update_metadata(request).await?.into_inner();
@@ -769,18 +1080,22 @@ impl DiskAPI for RemoteDisk {
     ) -> Result<FileInfo> {
         info!("read_version");
         let opts_str = serde_json::to_string(opts)?;
+        let opts_bin = encode_msgpack(opts)?;
 
         self.execute_with_timeout(
-            || async {
-                let mut client = node_service_time_out_client(&self.addr)
+            move || async {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadVersionRequest {
-                    disk: self.endpoint.to_string(),
+                    disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                     version_id: version_id.to_string(),
-                    opts: opts_str.clone(),
+                    opts: opts_str,
+                    opts_bin: opts_bin.into(),
                 });
 
                 let response = client.read_version(request).await?.into_inner();
@@ -789,7 +1104,7 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let file_info = serde_json::from_str::<FileInfo>(&response.file_info)?;
+                let file_info = decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info)?;
 
                 Ok(file_info)
             },
@@ -804,11 +1119,13 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadXlRequest {
-                    disk: self.endpoint.to_string(),
+                    disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                     read_data,
@@ -820,7 +1137,7 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
+                let raw_file_info = decode_msgpack_or_json::<RawFileInfo>(&response.raw_file_info_bin, &response.raw_file_info)?;
 
                 Ok(raw_file_info)
             },
@@ -840,10 +1157,12 @@ impl DiskAPI for RemoteDisk {
     ) -> Result<RenameDataResp> {
         info!("rename_data {}/{}/{}/{}", self.addr, self.endpoint.to_string(), dst_volume, dst_path);
 
-        self.execute_with_timeout(
+        self.execute_with_timeout_for_op(
+            "rename_data",
             || async {
                 let file_info = serde_json::to_string(&fi)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(RenameDataRequest {
@@ -874,78 +1193,100 @@ impl DiskAPI for RemoteDisk {
     async fn list_dir(&self, _origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         debug!("list_dir {}/{}", volume, dir_path);
 
-        if self.health.is_faulty() {
-            return Err(DiskError::FaultyDisk);
-        }
+        self.execute_with_timeout(
+            || async {
+                let disk = self.disk_ref().await;
 
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(ListDirRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            dir_path: dir_path.to_string(),
-            count,
-        });
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(ListDirRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    dir_path: dir_path.to_string(),
+                    count,
+                });
 
-        let response = client.list_dir(request).await?.into_inner();
+                let response = client.list_dir(request).await?.into_inner();
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(response.volumes)
+                Ok(response.volumes)
+            },
+            get_drive_list_dir_timeout(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self, wr))]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         info!("walk_dir {}", self.endpoint.to_string());
 
-        if self.health.is_faulty() {
-            return Err(DiskError::FaultyDisk);
-        }
+        let disk = self.disk_ref().await;
+        let body = serde_json::to_vec(&opts)?;
+        let stall_timeout = get_drive_walkdir_stall_timeout();
+        let bucket = opts.bucket.clone();
+        let base_dir = opts.base_dir.clone();
+        let disk_for_log = disk.clone();
 
-        let url = format!(
-            "{}/rustfs/rpc/walk_dir?disk={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
-        );
+        self.execute_with_timeout_for_op_and_health_action(
+            "walk_dir",
+            || async {
+                let mut last_err = None;
 
-        let opts = serde_json::to_vec(&opts)?;
+                for attempt in 1..=2 {
+                    let mut reader = match self
+                        .data_transport
+                        .open_walk_dir(WalkDirStreamRequest {
+                            endpoint: self.endpoint.grid_host(),
+                            disk: disk.clone(),
+                            body: body.clone(),
+                            stall_timeout: Some(stall_timeout),
+                        })
+                        .await
+                    {
+                        Ok(reader) => reader,
+                        Err(err) => {
+                            if attempt == 1 && Self::is_retryable_walk_dir_error(&err) {
+                                warn!(
+                                    endpoint = %self.endpoint,
+                                    addr = %self.addr,
+                                    disk = %disk_for_log,
+                                    bucket = %bucket,
+                                    base_dir = %base_dir,
+                                    attempt,
+                                    stall_timeout_ms = stall_timeout.as_millis(),
+                                    error = %err,
+                                    "remote walk_dir returned retryable transport error; retrying"
+                                );
+                                last_err = Some(err);
+                                continue;
+                            }
 
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::GET, &mut headers);
+                            return Err(err);
+                        }
+                    };
 
-        let mut reader = HttpReader::new(url, Method::GET, headers, Some(opts)).await?;
+                    match copy_stream_with_buffer(&mut reader, wr, DEFAULT_READ_BUFFER_SIZE).await {
+                        Ok(_) => return Ok(()),
+                        Err(io_err) => return Err(DiskError::Io(io_err)),
+                    }
+                }
 
-        tokio::io::copy(&mut reader, wr).await?;
-
-        Ok(())
+                Err(last_err.unwrap_or_else(|| DiskError::other("walk_dir retry exhausted without captured error")))
+            },
+            get_drive_walkdir_timeout(),
+            FailureHealthAction::IgnoreFailure,
+        )
+        .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
-        info!("read_file {}/{}", volume, path);
-
-        if self.health.is_faulty() {
-            return Err(DiskError::FaultyDisk);
-        }
-
-        let url = format!(
-            "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            0,
-            0
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::GET, &mut headers);
-        Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
+        self.read_file_stream(volume, path, 0, 0).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -962,21 +1303,35 @@ impl DiskAPI for RemoteDisk {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
         }
+        let disk = self.disk_ref().await;
+        self.data_transport
+            .open_read(ReadStreamRequest {
+                endpoint: self.endpoint.grid_host(),
+                disk,
+                volume: volume.to_string(),
+                path: path.to_string(),
+                offset,
+                length,
+            })
+            .await
+    }
 
-        let url = format!(
-            "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            offset,
-            length
-        );
+    /// Zero-copy read for remote disks falls back to efficient network read.
+    /// Note: True zero-copy is not possible over network, but we avoid extra copies
+    /// by reading directly into Bytes.
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        // For remote disks, use the regular reader and read into Bytes
+        let reader = self.read_file_stream(volume, path, offset, length).await?;
 
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::GET, &mut headers);
-        Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
+        use tokio::io::AsyncReadExt;
+        let mut reader = reader;
+
+        // Read all data into Bytes (single allocation)
+        let mut buffer = Vec::with_capacity(length);
+        reader.read_to_end(&mut buffer).await?;
+
+        Ok(Bytes::from(buffer))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -986,21 +1341,17 @@ impl DiskAPI for RemoteDisk {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
         }
-
-        let url = format!(
-            "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            true,
-            0
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::PUT, &mut headers);
-        Ok(Box::new(HttpWriter::new(url, Method::PUT, headers).await?))
+        let disk = self.disk_ref().await;
+        self.data_transport
+            .open_write(WriteStreamRequest {
+                endpoint: self.endpoint.grid_host(),
+                disk,
+                volume: volume.to_string(),
+                path: path.to_string(),
+                append: true,
+                size: 0,
+            })
+            .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1016,21 +1367,17 @@ impl DiskAPI for RemoteDisk {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
         }
-
-        let url = format!(
-            "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            false,
-            file_size
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::PUT, &mut headers);
-        Ok(Box::new(HttpWriter::new(url, Method::PUT, headers).await?))
+        let disk = self.disk_ref().await;
+        self.data_transport
+            .open_write(WriteStreamRequest {
+                endpoint: self.endpoint.grid_host(),
+                disk,
+                volume: volume.to_string(),
+                path: path.to_string(),
+                append: false,
+                size: file_size,
+            })
+            .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1039,7 +1386,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(RenameFileRequest {
@@ -1069,7 +1417,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(RenamePartRequest {
@@ -1101,7 +1450,8 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(&opt)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(DeleteRequest {
@@ -1131,7 +1481,8 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let file_info = serde_json::to_string(&fi)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(VerifyFileRequest {
@@ -1160,7 +1511,8 @@ impl DiskAPI for RemoteDisk {
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadPartsRequest {
@@ -1190,7 +1542,8 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let file_info = serde_json::to_string(&fi)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(CheckPartsRequest {
@@ -1222,12 +1575,16 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let read_multiple_req = serde_json::to_string(&req)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let read_multiple_req_bin = encode_msgpack(&req)?;
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadMultipleRequest {
-                    disk: self.endpoint.to_string(),
+                    disk,
                     read_multiple_req,
+                    read_multiple_req_bin: read_multiple_req_bin.into(),
                 });
 
                 let response = client.read_multiple(request).await?.into_inner();
@@ -1236,11 +1593,19 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let read_multiple_resps = response
-                    .read_multiple_resps
-                    .into_iter()
-                    .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(&json_str).ok())
-                    .collect();
+                let read_multiple_resps = if !response.read_multiple_resps_bin.is_empty() {
+                    response
+                        .read_multiple_resps_bin
+                        .into_iter()
+                        .filter_map(|buf| decode_msgpack_or_json::<ReadMultipleResp>(&buf, "").ok())
+                        .collect()
+                } else {
+                    response
+                        .read_multiple_resps
+                        .into_iter()
+                        .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(&json_str).ok())
+                        .collect()
+                };
 
                 Ok(read_multiple_resps)
             },
@@ -1255,19 +1620,48 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let data_len = data.len();
+                let disk = self.disk_ref().await;
+                let mut client = self.get_client().await.map_err(|err| {
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
+                    Error::other(format!("can not get client, err: {err}"))
+                })?;
                 let request = Request::new(WriteAllRequest {
-                    disk: self.endpoint.to_string(),
+                    disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                     data,
                 });
 
-                let response = client.write_all(request).await?.into_inner();
+                global_internode_metrics().record_outgoing_request_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                );
+                let response = match client.write_all(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        global_internode_metrics().record_error_for_operation_and_backend(
+                            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                            INTERNODE_TRANSPORT_BACKEND_GRPC,
+                        );
+                        return Err(err.into());
+                    }
+                };
+
+                global_internode_metrics().record_sent_bytes_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    data_len,
+                );
 
                 if !response.success {
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
                     return Err(response.error.unwrap_or_default().into());
                 }
 
@@ -1284,21 +1678,48 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let disk = self.disk_ref().await;
+                let mut client = self.get_client().await.map_err(|err| {
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_READ_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
+                    Error::other(format!("can not get client, err: {err}"))
+                })?;
                 let request = Request::new(ReadAllRequest {
-                    disk: self.endpoint.to_string(),
+                    disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                 });
 
-                let response = client.read_all(request).await?.into_inner();
+                global_internode_metrics().record_outgoing_request_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_READ_ALL,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                );
+                let response = match client.read_all(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        global_internode_metrics().record_error_for_operation_and_backend(
+                            INTERNODE_OPERATION_GRPC_READ_ALL,
+                            INTERNODE_TRANSPORT_BACKEND_GRPC,
+                        );
+                        return Err(err.into());
+                    }
+                };
 
                 if !response.success {
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_READ_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
                     return Err(response.error.unwrap_or_default().into());
                 }
 
+                global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_READ_ALL,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    response.data.len(),
+                );
                 Ok(response.data)
             },
             get_max_timeout_duration(),
@@ -1308,40 +1729,234 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
-        if self.health.is_faulty() {
-            return Err(DiskError::FaultyDisk);
-        }
+        self.execute_with_timeout_for_op(
+            "disk_info",
+            || async {
+                let opts = serde_json::to_string(&opts)?;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(DiskInfoRequest {
+                    disk: self.endpoint.to_string(),
+                    opts,
+                });
 
-        let opts = serde_json::to_string(&opts)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(DiskInfoRequest {
-            disk: self.endpoint.to_string(),
-            opts,
-        });
+                let response = client.disk_info(request).await?.into_inner();
 
-        let response = client.disk_info(request).await?.into_inner();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let disk_info = serde_json::from_str::<DiskInfo>(&response.disk_info)?;
 
-        let disk_info = serde_json::from_str::<DiskInfo>(&response.disk_info)?;
+                Ok(disk_info)
+            },
+            get_drive_disk_info_timeout(),
+        )
+        .await
+    }
 
-        Ok(disk_info)
+    #[tracing::instrument(skip(self))]
+    fn start_scan(&self) -> ScanGuard {
+        self.scanning.fetch_add(1, Ordering::Relaxed);
+        ScanGuard(Arc::clone(&self.scanning))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Once;
+    use crate::rpc::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
+    use rustfs_common::GLOBAL_CONN_MAP;
+    use std::pin::Pin;
+    use std::sync::{Mutex as StdMutex, Once};
+    use std::task::{Context, Poll};
+    use tokio::io::{ReadBuf, duplex};
     use tokio::net::TcpListener;
+    use tonic::transport::Endpoint as TonicEndpoint;
     use tracing::Level;
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    #[derive(Debug, Clone)]
+    enum RecordedTransportCall {
+        Read(ReadStreamRequest),
+        Write(WriteStreamRequest),
+        WalkDir(WalkDirStreamRequest),
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordingInternodeDataTransport {
+        calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
+    }
+
+    impl RecordingInternodeDataTransport {
+        fn calls(&self) -> Vec<RecordedTransportCall> {
+            self.calls.lock().expect("recorded transport calls lock poisoned").clone()
+        }
+
+        fn record(&self, call: RecordedTransportCall) {
+            self.calls.lock().expect("recorded transport calls lock poisoned").push(call);
+        }
+    }
+
+    #[derive(Debug)]
+    enum WalkDirTestStep {
+        Error(DiskError),
+        Data(Vec<u8>),
+        PartialDataThenError { data: Vec<u8>, error: io::Error },
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RetryingWalkDirInternodeDataTransport {
+        calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
+        steps: Arc<StdMutex<Vec<WalkDirTestStep>>>,
+    }
+
+    impl RetryingWalkDirInternodeDataTransport {
+        fn with_steps(steps: Vec<WalkDirTestStep>) -> Self {
+            Self {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                steps: Arc::new(StdMutex::new(steps)),
+            }
+        }
+
+        fn calls(&self) -> Vec<RecordedTransportCall> {
+            self.calls.lock().expect("recorded transport calls lock poisoned").clone()
+        }
+
+        fn record(&self, call: RecordedTransportCall) {
+            self.calls.lock().expect("recorded transport calls lock poisoned").push(call);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct EmptyTestReader;
+
+    impl AsyncRead for EmptyTestReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct SinkTestWriter;
+
+    impl AsyncWrite for SinkTestWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for RecordingInternodeDataTransport {
+        async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            self.record(RecordedTransportCall::Read(request));
+            Ok(Box::new(EmptyTestReader))
+        }
+
+        async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
+            self.record(RecordedTransportCall::Write(request));
+            Ok(Box::new(SinkTestWriter))
+        }
+
+        async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
+            self.record(RecordedTransportCall::WalkDir(request));
+            Ok(Box::new(EmptyTestReader))
+        }
+
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for RetryingWalkDirInternodeDataTransport {
+        async fn open_read(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            panic!("open_read should not be used in walk_dir retry test");
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            panic!("open_write should not be used in walk_dir retry test");
+        }
+
+        async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
+            self.record(RecordedTransportCall::WalkDir(request));
+            let step = self.steps.lock().expect("walk_dir retry steps lock poisoned").remove(0);
+            match step {
+                WalkDirTestStep::Error(err) => Err(err),
+                WalkDirTestStep::Data(data) => Ok(Box::new(Cursor::new(data))),
+                WalkDirTestStep::PartialDataThenError { data, error } => Ok(Box::new(PartialThenErrorReader {
+                    cursor: Cursor::new(data),
+                    error: Some(error),
+                })),
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "retrying-walk-dir"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    async fn new_remote_disk_with_transport(data_transport: Arc<dyn InternodeDataTransport>) -> RemoteDisk {
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://remote-node:9000/data/rustfs0").unwrap(),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        RemoteDisk::new(&endpoint, &disk_option, data_transport).await.unwrap()
+    }
+
+    #[derive(Debug)]
+    struct PartialThenErrorReader {
+        cursor: Cursor<Vec<u8>>,
+        error: Option<io::Error>,
+    }
+
+    impl AsyncRead for PartialThenErrorReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let filled_before = buf.filled().len();
+            match Pin::new(&mut self.cursor).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    if buf.filled().len() > filled_before {
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    if let Some(err) = self.error.take() {
+                        return Poll::Ready(Err(err));
+                    }
+
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
 
     fn init_tracing(filter_level: Level) {
         INIT.call_once(|| {
@@ -1370,7 +1985,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
 
         assert!(!remote_disk.is_local());
         assert_eq!(remote_disk.endpoint.url, url);
@@ -1396,7 +2013,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
 
         // Test basic properties
         assert!(!remote_disk.is_local());
@@ -1428,7 +2047,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
         let path = remote_disk.path();
 
         // Remote disk path should be based on the URL path
@@ -1454,7 +2075,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
         assert!(remote_disk.is_online().await);
 
         drop(listener);
@@ -1480,17 +2103,57 @@ mod tests {
             disk_idx: 0,
         };
 
-        let disk_option = DiskOption {
-            cleanup: false,
-            health_check: true,
-        };
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS, Some("1")),
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1")),
+            ],
+            async {
+                let disk_option = DiskOption {
+                    cleanup: false,
+                    health_check: true,
+                };
 
-        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+                let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+                    .await
+                    .unwrap();
+                remote_disk.enable_health_check();
 
-        // wait for health check connect timeout
-        tokio::time::sleep(Duration::from_secs(6)).await;
+                // Wait out the initial success-grace window so the active probe loop
+                // actually attempts a connectivity check. Under the new
+                // suspect-first semantics we only need to prove that the drive
+                // transitions away from a clean Online state at least once.
+                tokio::time::sleep(SKIP_IF_SUCCESS_BEFORE + Duration::from_secs(2)).await;
+                assert!(
+                    remote_disk.offline_duration_secs().is_some(),
+                    "missing listener should transition the drive through suspect/offline tracking"
+                );
+                assert_ne!(
+                    remote_disk.runtime_state(),
+                    RuntimeDriveHealthState::Online,
+                    "missing listener should not remain in a clean Online state after probing"
+                );
+            },
+        )
+        .await;
+    }
 
-        assert!(!remote_disk.is_online().await);
+    #[tokio::test]
+    async fn test_copy_stream_with_buffer_copies_full_payload() {
+        let payload = b"walk-dir-stream".repeat(1024);
+        let expected = payload.clone();
+        let (mut write_half, mut read_half) = duplex(128);
+
+        let copy_task = tokio::spawn(async move {
+            let mut cursor = Cursor::new(payload);
+            copy_stream_with_buffer(&mut cursor, &mut write_half, 4 * 1024).await.unwrap();
+        });
+
+        let mut copied = Vec::new();
+        read_half.read_to_end(&mut copied).await.unwrap();
+        copy_task.await.unwrap();
+
+        assert_eq!(copied, expected);
     }
 
     #[tokio::test]
@@ -1509,7 +2172,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
 
         // Initially, disk ID should be None
         let initial_id = remote_disk.get_disk_id().await.unwrap();
@@ -1527,6 +2192,188 @@ mod tests {
         remote_disk.set_disk_id(None).await.unwrap();
         let cleared_id = remote_disk.get_disk_id().await.unwrap();
         assert!(cleared_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_ref_prefers_disk_id() {
+        let url = url::Url::parse("http://remote-server:9000").unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
+        assert_eq!(remote_disk.disk_ref().await, endpoint.to_string());
+
+        let disk_id = Uuid::new_v4();
+        remote_disk.set_disk_id(Some(disk_id)).await.unwrap();
+
+        assert_eq!(remote_disk.disk_ref().await, disk_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_read_file_stream_uses_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let expected_disk = remote_disk.disk_ref().await;
+
+        let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::Read(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.volume, "bucket");
+                assert_eq!(request.path, "object/part.1");
+                assert_eq!(request.offset, 7);
+                assert_eq!(request.length, 11);
+            }
+            other => panic!("expected read transport call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_create_and_append_file_use_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let expected_disk = remote_disk.disk_ref().await;
+
+        let _created = remote_disk
+            .create_file("orig-bucket", "bucket", "object/part.1", 4096)
+            .await
+            .unwrap();
+        let _appended = remote_disk.append_file("bucket", "object/part.2").await.unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2);
+
+        match &calls[0] {
+            RecordedTransportCall::Write(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.volume, "bucket");
+                assert_eq!(request.path, "object/part.1");
+                assert!(!request.append);
+                assert_eq!(request.size, 4096);
+            }
+            other => panic!("expected create write transport call, got {other:?}"),
+        }
+
+        match &calls[1] {
+            RecordedTransportCall::Write(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.volume, "bucket");
+                assert_eq!(request.path, "object/part.2");
+                assert!(request.append);
+                assert_eq!(request.size, 0);
+            }
+            other => panic!("expected append write transport call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_walk_dir_uses_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let expected_disk = remote_disk.disk_ref().await;
+        let opts = WalkDirOptions {
+            bucket: "bucket".to_string(),
+            base_dir: "prefix".to_string(),
+            recursive: true,
+            report_notfound: false,
+            filter_prefix: Some("part".to_string()),
+            forward_to: None,
+            limit: 10,
+            disk_id: String::new(),
+        };
+        let expected_body = serde_json::to_vec(&opts).unwrap();
+        let mut writer = Vec::new();
+
+        remote_disk.walk_dir(opts, &mut writer).await.unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::WalkDir(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.body, expected_body);
+                assert_eq!(request.stall_timeout, Some(get_drive_walkdir_stall_timeout()));
+            }
+            other => panic!("expected walk-dir transport call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_walk_dir_retries_once_on_retryable_transport_error() {
+        let transport = RetryingWalkDirInternodeDataTransport::with_steps(vec![
+            WalkDirTestStep::Error(DiskError::other("HttpReader stream error: error decoding response body")),
+            WalkDirTestStep::Data(b"walk-dir-retry-ok".to_vec()),
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let opts = WalkDirOptions {
+            bucket: "bucket".to_string(),
+            base_dir: "config/iam".to_string(),
+            recursive: true,
+            report_notfound: false,
+            filter_prefix: None,
+            forward_to: None,
+            limit: 10,
+            disk_id: String::new(),
+        };
+        let mut writer = Vec::new();
+
+        remote_disk
+            .walk_dir(opts, &mut writer)
+            .await
+            .expect("retryable walk_dir error should recover");
+
+        assert_eq!(writer, b"walk-dir-retry-ok");
+        assert_eq!(transport.calls().len(), 2, "walk_dir should retry exactly once");
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_walk_dir_does_not_retry_after_partial_stream_failure() {
+        let transport = RetryingWalkDirInternodeDataTransport::with_steps(vec![
+            WalkDirTestStep::PartialDataThenError {
+                data: b"partial-walk-dir".to_vec(),
+                error: io::Error::new(io::ErrorKind::ConnectionReset, "connection reset"),
+            },
+            WalkDirTestStep::Data(b"walk-dir-retry-ok".to_vec()),
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let opts = WalkDirOptions {
+            bucket: "bucket".to_string(),
+            base_dir: "config/iam".to_string(),
+            recursive: true,
+            report_notfound: false,
+            filter_prefix: None,
+            forward_to: None,
+            limit: 10,
+            disk_id: String::new(),
+        };
+        let mut writer = Vec::new();
+
+        let err = remote_disk
+            .walk_dir(opts, &mut writer)
+            .await
+            .expect_err("partial stream failure should be returned without retry");
+
+        assert!(matches!(err, DiskError::Io(ref io_err) if io_err.kind() == io::ErrorKind::ConnectionReset));
+        assert_eq!(writer, b"partial-walk-dir");
+        assert_eq!(transport.calls().len(), 1, "walk_dir should not retry after writing partial bytes");
     }
 
     #[tokio::test]
@@ -1553,7 +2400,9 @@ mod tests {
                 health_check: false,
             };
 
-            let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+            let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+                .await
+                .unwrap();
 
             assert!(!remote_disk.is_local());
             assert_eq!(remote_disk.host_name(), expected_hostname);
@@ -1579,7 +2428,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = RemoteDisk::new(&valid_endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&valid_endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
         let location = remote_disk.get_disk_location();
         assert!(location.valid());
         assert_eq!(location.pool_idx, Some(0));
@@ -1595,7 +2446,9 @@ mod tests {
             disk_idx: -1,
         };
 
-        let remote_disk_invalid = RemoteDisk::new(&invalid_endpoint, &disk_option).await.unwrap();
+        let remote_disk_invalid = RemoteDisk::new(&invalid_endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
         let invalid_location = remote_disk_invalid.get_disk_location();
         assert!(!invalid_location.valid());
         assert_eq!(invalid_location.pool_idx, None);
@@ -1619,11 +2472,386 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
 
         // Test close operation (should succeed)
         let result = remote_disk.close().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_marks_remote_disk_faulty() {
+        let url = url::Url::parse("http://remote-timeout:9000").unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .unwrap();
+
+        let err = remote_disk
+            .execute_with_timeout(
+                || async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok::<(), Error>(())
+                },
+                Duration::from_millis(10),
+            )
+            .await
+            .expect_err("timeout should fail");
+
+        assert!(err.to_string().contains("timeout"));
+        assert!(remote_disk.is_online().await, "first timeout should keep the remote disk online");
+        assert_eq!(
+            remote_disk.runtime_state(),
+            RuntimeDriveHealthState::Suspect,
+            "first timeout should move the remote disk into suspect state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_can_ignore_remote_timeout_failure() {
+        let url = url::Url::parse("http://remote-timeout-ignored:9000").unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .unwrap();
+
+        let err = remote_disk
+            .execute_with_timeout_for_op_and_health_action(
+                "walk_dir",
+                || async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok::<(), Error>(())
+                },
+                Duration::from_millis(10),
+                FailureHealthAction::IgnoreFailure,
+            )
+            .await
+            .expect_err("timeout should fail");
+
+        assert!(err.to_string().contains("timeout"));
+        assert!(remote_disk.is_online().await, "ignored timeout should not mark remote disk faulty");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_zero_duration_waits_for_operation() {
+        let url = url::Url::parse("http://remote-no-timeout:9000").unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .unwrap();
+
+        remote_disk
+            .execute_with_timeout(
+                || async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok::<(), Error>(())
+                },
+                Duration::ZERO,
+            )
+            .await
+            .expect("zero duration should disable the operation timeout");
+
+        assert!(
+            remote_disk.is_online().await,
+            "successful no-timeout operation should keep remote disk online"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_evicts_cached_connection() {
+        let addr = "http://127.0.0.1:59991".to_string();
+        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .unwrap();
+
+        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
+
+        let _ = remote_disk
+            .execute_with_timeout(
+                || async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok::<(), Error>(())
+                },
+                Duration::from_millis(10),
+            )
+            .await
+            .expect_err("timeout should fail");
+
+        assert!(
+            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "timeout should evict cached connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_marks_faulty_on_timeout_like_error() {
+        let addr = "http://127.0.0.1:59992".to_string();
+        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .unwrap();
+
+        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+
+        let err = remote_disk
+            .execute_with_timeout(
+                || async { Err::<(), Error>(DiskError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "stall timeout"))) },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("timeout-like operation error should fail");
+
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io timeout error, got {other:?}"),
+            },
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(
+            remote_disk.is_online().await,
+            "first timeout-like error should keep the remote disk online"
+        );
+        assert_eq!(
+            remote_disk.runtime_state(),
+            RuntimeDriveHealthState::Suspect,
+            "first timeout-like error should move the remote disk into suspect state"
+        );
+        assert!(
+            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "timeout-like errors should evict cached connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_marks_faulty_on_network_like_error() {
+        let addr = "http://127.0.0.1:59993".to_string();
+        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .unwrap();
+
+        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+
+        let err = remote_disk
+            .execute_with_timeout(
+                || async {
+                    Err::<(), Error>(DiskError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    )))
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("network-like operation error should fail");
+
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io network error, got {other:?}"),
+            },
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert!(
+            remote_disk.is_online().await,
+            "first network-like error should keep the remote disk online"
+        );
+        assert_eq!(
+            remote_disk.runtime_state(),
+            RuntimeDriveHealthState::Suspect,
+            "first network-like error should move the remote disk into suspect state"
+        );
+        assert!(
+            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "network-like errors should evict cached connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_can_ignore_network_like_error() {
+        let addr = "http://127.0.0.1:59995".to_string();
+        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .unwrap();
+
+        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+
+        let err = remote_disk
+            .execute_with_timeout_for_op_and_health_action(
+                "walk_dir",
+                || async { Err::<(), Error>(DiskError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "stall timeout"))) },
+                Duration::from_secs(1),
+                FailureHealthAction::IgnoreFailure,
+            )
+            .await
+            .expect_err("timeout-like operation error should fail");
+
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io timeout error, got {other:?}"),
+            },
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(
+            remote_disk.is_online().await,
+            "ignored network-like error should not mark remote disk faulty"
+        );
+        assert!(
+            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "ignored network-like error should not evict cached connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_keeps_remote_disk_online_for_business_error() {
+        let addr = "http://127.0.0.1:59994".to_string();
+        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .unwrap();
+
+        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+
+        let err = remote_disk
+            .execute_with_timeout(|| async { Err::<(), Error>(DiskError::FileNotFound) }, Duration::from_secs(1))
+            .await
+            .expect_err("business error should still fail the operation");
+
+        assert_eq!(err, DiskError::FileNotFound);
+        assert!(remote_disk.is_online().await, "business errors should not mark remote disk faulty");
+        assert!(
+            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "business errors should not evict cached connection"
+        );
     }
 
     #[test]

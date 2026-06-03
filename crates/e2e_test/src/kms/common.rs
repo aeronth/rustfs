@@ -22,11 +22,13 @@
 //! - KMS backend configuration (Local and Vault)
 //! - SSE encryption testing utilities
 
-use crate::common::{RustFSTestEnvironment, awscurl_get, awscurl_post, init_logging as common_init_logging};
+use crate::common::{
+    RustFSTestEnvironment, awscurl_available, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client,
+};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -44,11 +46,25 @@ pub const VAULT_ADDRESS: &str = "127.0.0.1:8200";
 pub const VAULT_TOKEN: &str = "dev-root-token";
 pub const VAULT_TRANSIT_PATH: &str = "transit";
 pub const VAULT_KEY_NAME: &str = "rustfs-master-key";
+pub const ENV_TEST_VAULT_BIN: &str = "RUSTFS_TEST_VAULT_BIN";
 
 /// Initialize tracing for KMS tests with KMS-specific log levels
 pub fn init_logging() {
     common_init_logging();
     // Additional KMS-specific logging configuration can be added here if needed
+}
+
+pub fn skip_if_kms_admin_tool_unavailable(test_name: &str) -> bool {
+    if awscurl_available() {
+        return false;
+    }
+
+    info!("Skipping {} because awscurl is not available in PATH", test_name);
+    true
+}
+
+pub fn sse_customer_key_md5_base64(key: &str) -> String {
+    BASE64.encode(md5::compute(key).0)
 }
 
 // KMS-specific helper functions
@@ -117,7 +133,7 @@ pub async fn create_default_key(
 
 /// Create a KMS key with a specific ID (by directly writing to the key directory)
 pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use rand::RngCore;
+    use rand::Rng;
     use std::collections::HashMap;
     use tokio::fs;
 
@@ -133,10 +149,10 @@ pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<
         "usage": "EncryptDecrypt",
         "status": "Active",
         "metadata": HashMap::<String, String>::new(),
-        "created_at": chrono::Utc::now().to_rfc3339(),
+        "created_at": format!("{}[UTC]", chrono::Utc::now().to_rfc3339()),
         "rotated_at": serde_json::Value::Null,
         "created_by": "e2e-test",
-        "encrypted_key_material": key_data.to_vec(),
+        "encrypted_key_material": BASE64.encode(key_data),
         "nonce": Vec::<u8>::new()
     });
 
@@ -155,7 +171,7 @@ pub async fn test_sse_c_encryption(s3_client: &Client, bucket: &str) -> Result<(
 
     let test_key = "01234567890123456789012345678901"; // 32-byte key
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let test_key_md5 = format!("{:x}", md5::compute(test_key));
+    let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let test_data = b"Hello, KMS SSE-C World!";
     let object_key = "test-sse-c-object";
 
@@ -272,6 +288,10 @@ pub async fn test_kms_key_management(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if skip_if_kms_admin_tool_unavailable("test_kms_key_management") {
+        return Ok(());
+    }
+
     info!("Testing KMS key management APIs");
 
     // Test CreateKey
@@ -324,8 +344,8 @@ pub async fn test_error_scenarios(s3_client: &Client, bucket: &str) -> Result<()
     let wrong_key = "98765432109876543210987654321098";
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
     let wrong_key_b64 = base64::engine::general_purpose::STANDARD.encode(wrong_key);
-    let test_key_md5 = format!("{:x}", md5::compute(test_key));
-    let wrong_key_md5 = format!("{:x}", md5::compute(wrong_key));
+    let test_key_md5 = sse_customer_key_md5_base64(test_key);
+    let wrong_key_md5 = sse_customer_key_md5_base64(wrong_key);
     let test_data = b"Test data for error scenarios";
     let object_key = "test-error-object";
 
@@ -366,6 +386,10 @@ pub struct VaultTestEnvironment {
 }
 
 impl VaultTestEnvironment {
+    fn resolve_vault_binary() -> String {
+        std::env::var(ENV_TEST_VAULT_BIN).unwrap_or_else(|_| "vault".to_string())
+    }
+
     /// Create a new Vault test environment
     pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let base_env = RustFSTestEnvironment::new().await?;
@@ -380,7 +404,8 @@ impl VaultTestEnvironment {
     pub async fn start_vault(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting Vault server in development mode");
 
-        let vault_process = Command::new("vault")
+        let vault_binary = Self::resolve_vault_binary();
+        let vault_process = Command::new(&vault_binary)
             .args([
                 "server",
                 "-dev",
@@ -406,11 +431,11 @@ impl VaultTestEnvironment {
             let port_check = TcpStream::connect(VAULT_ADDRESS).await.is_ok();
             if port_check {
                 // Additional check by making a health request
-                if let Ok(response) = reqwest::get(&format!("{VAULT_URL}/v1/sys/health")).await {
-                    if response.status().is_success() {
-                        info!("Vault server is ready after {} seconds", i);
-                        return Ok(());
-                    }
+                if let Ok(response) = local_http_client().get(format!("{VAULT_URL}/v1/sys/health")).send().await
+                    && response.status().is_success()
+                {
+                    info!("Vault server is ready after {} seconds", i);
+                    return Ok(());
                 }
             }
 
@@ -426,7 +451,7 @@ impl VaultTestEnvironment {
 
     /// Setup Vault transit secrets engine
     pub async fn setup_vault_transit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let client = reqwest::Client::new();
+        let client = local_http_client();
 
         info!("Enabling Vault transit secrets engine");
 
@@ -471,10 +496,10 @@ impl VaultTestEnvironment {
         self.base_env.start_rustfs_server(Vec::new()).await
     }
 
-    /// Configure Vault KMS backend
-    pub async fn configure_vault_kms(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Configure Vault Transit KMS backend
+    pub async fn configure_vault_transit_kms(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let kms_config = serde_json::json!({
-            "backend_type": "vault",
+            "backend_type": "VaultTransit",
             "address": VAULT_URL,
             "auth_method": {
                 "Token": {
@@ -482,8 +507,6 @@ impl VaultTestEnvironment {
                 }
             },
             "mount_path": VAULT_TRANSIT_PATH,
-            "kv_mount": "secret",
-            "key_path_prefix": "rustfs/kms/keys",
             "default_key_id": VAULT_KEY_NAME,
             "skip_tls_verify": true
         })
@@ -687,7 +710,7 @@ pub async fn test_multipart_upload_with_config(
 /// Create a standard SSE-C encryption configuration for testing
 pub fn create_sse_c_config() -> EncryptionType {
     let key = "01234567890123456789012345678901"; // 32-byte key
-    let key_md5 = format!("{:x}", md5::compute(key));
+    let key_md5 = sse_customer_key_md5_base64(key);
     EncryptionType::SSEC {
         key: key.to_string(),
         key_md5,
@@ -768,7 +791,7 @@ impl LocalKMSTestEnvironment {
 
         // Configure KMS with the default key in one step
         let kms_config = serde_json::json!({
-            "backend_type": "local",
+            "backend_type": "Local",
             "key_dir": self.kms_keys_dir,
             "file_permissions": 0o600,
             "default_key_id": default_key_id

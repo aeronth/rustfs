@@ -13,117 +13,180 @@
 // limitations under the License.
 
 use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{Stream, TryStreamExt as _};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
-use std::error::Error as _;
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+};
+use rustfs_tls_runtime::{
+    load_cert_bundle_der_bytes, load_global_outbound_tls_generation, load_global_outbound_tls_state,
+    record_tls_consumer_stale_generation,
+};
+use rustfs_utils::get_env_opt_str;
+use rustls_pki_types::pem::PemObject;
+use std::io::IoSlice;
 use std::io::{self, Error};
+use std::net::IpAddr;
 use std::ops::Not as _;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::{self, Sleep};
 use tokio_util::io::StreamReader;
-use tracing::error;
+use tokio_util::sync::PollSender;
+use tracing::{error, warn};
 
-/// Get the TLS path from the RUSTFS_TLS_PATH environment variable.
-/// If the variable is not set, return None.
-fn tls_path() -> Option<&'static std::path::PathBuf> {
-    static TLS_PATH: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
-        std::env::var("RUSTFS_TLS_PATH")
-            .ok()
-            .and_then(|s| if s.is_empty() { None } else { Some(s.into()) })
-    });
-    TLS_PATH.as_ref()
-}
+const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
+const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
+const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 
-/// Load CA root certificates from the RUSTFS_TLS_PATH directory.
-/// The CA certificates should be in PEM format and stored in the file
-/// specified by the RUSTFS_CA_CERT constant.
-/// If the file does not exist or cannot be read, return the builder unchanged.
-fn load_ca_roots_from_tls_path(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    let Some(tp) = tls_path() else {
-        return builder;
-    };
-    let ca_path = tp.join(rustfs_config::RUSTFS_CA_CERT);
-    if !ca_path.exists() {
-        return builder;
-    }
-
-    let Ok(certs_der) = rustfs_utils::load_cert_bundle_der_bytes(ca_path.to_str().unwrap_or_default()) else {
-        return builder;
-    };
-
+fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[Vec<u8>]) -> reqwest::ClientBuilder {
     let mut b = builder;
     for der in certs_der {
-        if let Ok(cert) = Certificate::from_der(&der) {
+        if let Ok(cert) = Certificate::from_der(der) {
             b = b.add_root_certificate(cert);
         }
     }
     b
 }
 
-/// Load optional mTLS identity from the RUSTFS_TLS_PATH directory.
-/// The client certificate and private key should be in PEM format and stored in the files
-/// specified by RUSTFS_CLIENT_CERT_FILENAME and RUSTFS_CLIENT_KEY_FILENAME constants.
-/// If the files do not exist or cannot be read, return None.
-fn load_optional_mtls_identity_from_tls_path() -> Option<Identity> {
-    let tp = tls_path()?;
-    let cert = std::fs::read(tp.join(rustfs_config::RUSTFS_CLIENT_CERT_FILENAME)).ok()?;
-    let key = std::fs::read(tp.join(rustfs_config::RUSTFS_CLIENT_KEY_FILENAME)).ok()?;
+#[derive(Clone)]
+struct CachedClients {
+    generation: u64,
+    client: Client,
+    local_client: Client,
+}
 
-    let mut pem = Vec::with_capacity(cert.len() + key.len() + 1);
-    pem.extend_from_slice(&cert);
-    if !pem.ends_with(b"\n") {
-        pem.push(b'\n');
+static CLIENT_CACHE: LazyLock<Mutex<Option<CachedClients>>> = LazyLock::new(|| Mutex::new(None));
+
+async fn build_http_client(disable_proxy: bool, outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState) -> Client {
+    let mut builder = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .tcp_keepalive(std::time::Duration::from_secs(10))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(5))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
+        .http2_keep_alive_while_idle(true);
+
+    if disable_proxy {
+        builder = builder.no_proxy();
     }
-    pem.extend_from_slice(&key);
 
-    match Identity::from_pem(&pem) {
-        Ok(id) => Some(id),
-        Err(e) => {
-            error!("Failed to load mTLS identity from PEM: {e}");
+    if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
+        let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
+        match rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader).collect::<Result<Vec<_>, _>>() {
+            Ok(certs_der) => {
+                let certs_der = certs_der.into_iter().map(|cert| cert.to_vec()).collect::<Vec<_>>();
+                builder = add_root_certificates_from_der(builder, &certs_der);
+            }
+            Err(err) => {
+                warn!("Failed to parse published outbound root CA PEM; falling back to default trust roots: {err}");
+            }
+        }
+    } else if let Some(tp) = get_env_opt_str(rustfs_config::ENV_RUSTFS_TLS_PATH).and_then(|s| {
+        if s.is_empty() {
             None
+        } else {
+            Some(std::path::PathBuf::from(s))
+        }
+    }) {
+        let ca_path = tp.join(rustfs_config::RUSTFS_CA_CERT);
+        if ca_path.exists()
+            && let Some(ca_path_str) = ca_path.to_str()
+        {
+            match load_cert_bundle_der_bytes(ca_path_str) {
+                Ok(certs_der) => {
+                    builder = add_root_certificates_from_der(builder, &certs_der);
+                }
+                Err(err) => {
+                    warn!("Failed to parse fallback root CA bundle '{}': {}", ca_path.display(), err);
+                }
+            }
         }
     }
-}
 
-fn get_http_client() -> Client {
-    // Reuse the HTTP connection pool in the global `reqwest::Client` instance
-    // TODO: interact with load balancing?
-    static CLIENT: LazyLock<Client> = LazyLock::new(|| {
-        let mut builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .tcp_keepalive(std::time::Duration::from_secs(10))
-            .http2_keep_alive_interval(std::time::Duration::from_secs(5))
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
-            .http2_keep_alive_while_idle(true);
-
-        // HTTPS root trust + optional mTLS identity from RUSTFS_TLS_PATH
-        builder = load_ca_roots_from_tls_path(builder);
-        if let Some(id) = load_optional_mtls_identity_from_tls_path() {
-            builder = builder.identity(id);
+    if let Some(identity) = outbound_tls.mtls_identity.as_ref() {
+        let mut pem = Vec::with_capacity(identity.cert_pem.len() + identity.key_pem.len() + 1);
+        pem.extend_from_slice(&identity.cert_pem);
+        if !pem.ends_with(b"\n") {
+            pem.push(b'\n');
         }
+        pem.extend_from_slice(&identity.key_pem);
 
-        builder.build().expect("Failed to create global HTTP client")
-    });
-    CLIENT.clone()
-}
-
-static HTTP_DEBUG_LOG: bool = false;
-#[inline(always)]
-fn http_debug_log(args: std::fmt::Arguments) {
-    if HTTP_DEBUG_LOG {
-        println!("{args}");
+        match Identity::from_pem(&pem) {
+            Ok(id) => builder = builder.identity(id),
+            Err(e) => error!("Failed to load mTLS identity from PEM: {e}"),
+        }
     }
+
+    builder.build().expect("Failed to create global HTTP client")
 }
-macro_rules! http_log {
-    ($($arg:tt)*) => {
-        http_debug_log(format_args!($($arg)*));
+
+fn should_bypass_proxy_for_url(url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return false;
     };
+    let host = host.trim_matches(['[', ']']);
+
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
+}
+
+async fn get_http_client(url: &str) -> Client {
+    // Reuse HTTP connection pools while keeping loopback traffic away from
+    // system proxies so local RPC/tests do not leak to proxy listeners.
+    let disable_proxy = should_bypass_proxy_for_url(url);
+
+    // Fast path: check generation first (cheap atomic read) to avoid cloning
+    // the full PEM + identity bytes when the TLS state hasn't changed.
+    let generation = load_global_outbound_tls_generation().0;
+
+    let guard = CLIENT_CACHE.lock().await;
+    if let Some(cached) = guard.as_ref() {
+        if cached.generation == generation {
+            return if disable_proxy {
+                cached.local_client.clone()
+            } else {
+                cached.client.clone()
+            };
+        }
+        record_tls_consumer_stale_generation("rio_http_reader");
+    }
+    drop(guard);
+
+    // Cache miss or stale generation — load full outbound TLS state.
+    let outbound_tls = load_global_outbound_tls_state().await;
+
+    let client = build_http_client(false, &outbound_tls).await;
+    let local_client = build_http_client(true, &outbound_tls).await;
+    let cached = CachedClients {
+        generation,
+        client,
+        local_client,
+    };
+
+    let return_client = if disable_proxy {
+        cached.local_client.clone()
+    } else {
+        cached.client.clone()
+    };
+
+    let mut guard = CLIENT_CACHE.lock().await;
+    // Guard against races: only overwrite the cache if it is empty or
+    // contains an older generation, so a slower task cannot regress the
+    // TLS state after a faster task already cached a newer generation.
+    if guard.as_ref().is_none_or(|c| c.generation <= generation) {
+        *guard = Some(cached);
+    }
+    return_client
 }
 
 pin_project! {
@@ -131,6 +194,10 @@ pin_project! {
         url:String,
         method: Method,
         headers: HeaderMap,
+        track_internode_metrics: bool,
+        internode_operation: Option<&'static str>,
+        stall_timeout: Option<Duration>,
+        stall_timer: Option<Pin<Box<Sleep>>>,
         #[pin]
         inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
     }
@@ -139,8 +206,19 @@ pin_project! {
 impl HttpReader {
     pub async fn new(url: String, method: Method, headers: HeaderMap, body: Option<Vec<u8>>) -> io::Result<Self> {
         // http_log!("[HttpReader::new] url: {url}, method: {method:?}, headers: {headers:?}");
-        Self::with_capacity(url, method, headers, body, 0).await
+        Self::with_capacity_and_stall_timeout(url, method, headers, body, 0, None).await
     }
+
+    pub async fn new_with_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        Self::with_capacity_and_stall_timeout(url, method, headers, body, 0, stall_timeout).await
+    }
+
     /// Create a new HttpReader from a URL. The request is performed immediately.
     pub async fn with_capacity(
         url: String,
@@ -149,53 +227,56 @@ impl HttpReader {
         body: Option<Vec<u8>>,
         _read_buf_size: usize,
     ) -> io::Result<Self> {
-        // http_log!(
-        //     "[HttpReader::with_capacity] url: {url}, method: {method:?}, headers: {headers:?}, buf_size: {}",
-        //     _read_buf_size
-        // );
-        // First, check if the connection is available (HEAD)
-        let client = get_http_client();
-        let head_resp = client.head(&url).headers(headers.clone()).send().await;
-        match head_resp {
-            Ok(resp) => {
-                http_log!("[HttpReader::new] HEAD status: {}", resp.status());
-                if !resp.status().is_success() {
-                    return Err(Error::other(format!("HEAD failed: url: {}, status {}", url, resp.status())));
-                }
-            }
-            Err(e) => {
-                http_log!("[HttpReader::new] HEAD error: {e}");
-                return Err(Error::other(e.source().map(|s| s.to_string()).unwrap_or_else(|| e.to_string())));
-            }
-        }
+        Self::with_capacity_and_stall_timeout(url, method, headers, body, _read_buf_size, None).await
+    }
 
-        let client = get_http_client();
+    async fn with_capacity_and_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        _read_buf_size: usize,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        let track_internode_metrics = is_internode_rpc_url(&url);
+        let internode_operation = internode_rpc_operation(&url);
+        let client = get_http_client(&url).await;
         let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
         if let Some(body) = body {
             request = request.body(body);
         }
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| Error::other(format!("HttpReader HTTP request error: {e}")))?;
+        let resp = request.send().await.map_err(|e| {
+            record_internode_error(track_internode_metrics, internode_operation);
+            Error::other(format!("HttpReader HTTP request error for {method} {url}: {e}"))
+        })?;
 
         if resp.status().is_success().not() {
+            record_internode_error(track_internode_metrics, internode_operation);
             return Err(Error::other(format!(
-                "HttpReader HTTP request failed with non-200 status {}",
-                resp.status()
+                "HttpReader HTTP request failed for {method} {url} with non-200 status {}",
+                resp.status(),
             )));
         }
 
-        let stream = resp
-            .bytes_stream()
-            .map_err(|e| Error::other(format!("HttpReader stream error: {e}")));
+        record_internode_outgoing_request(track_internode_metrics, internode_operation);
+
+        let stream_error_url = url.clone();
+        let stream_error_method = method.clone();
+        let stream = resp.bytes_stream().map_err(move |e| {
+            record_internode_error(track_internode_metrics, internode_operation);
+            Error::other(format!("HttpReader stream error for {stream_error_method} {stream_error_url}: {e}"))
+        });
 
         Ok(Self {
             inner: StreamReader::new(Box::pin(stream)),
             url,
             method,
             headers,
+            track_internode_metrics,
+            internode_operation,
+            stall_timer: stall_timeout.map(|timeout| Box::pin(time::sleep(timeout))),
+            stall_timeout,
         })
     }
     pub fn url(&self) -> &str {
@@ -210,15 +291,40 @@ impl HttpReader {
 }
 
 impl AsyncRead for HttpReader {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        // http_log!(
-        //     "[HttpReader::poll_read] url: {}, method: {:?}, buf.remaining: {}",
-        //     self.url,
-        //     self.method,
-        //     buf.remaining()
-        // );
-        // Read from the inner stream
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let mut this = self.project();
+
+        let filled_before = buf.filled().len();
+        match this.inner.as_mut().poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let bytes_read = buf.filled().len().saturating_sub(filled_before);
+                if bytes_read > 0 {
+                    record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, bytes_read);
+                }
+                if bytes_read > 0 {
+                    if let Some(stall_timeout) = *this.stall_timeout {
+                        *this.stall_timer = Some(Box::pin(time::sleep(stall_timeout)));
+                    }
+                } else {
+                    *this.stall_timer = None;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => {
+                if let Some(timer) = this.stall_timer.as_mut()
+                    && timer.as_mut().poll(cx).is_ready()
+                {
+                    record_internode_error(*this.track_internode_metrics, *this.internode_operation);
+                    Poll::Ready(Err(Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HttpReader stall timeout: no data received before deadline",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+            other => other,
+        }
     }
 }
 
@@ -243,6 +349,8 @@ impl HashReaderDetector for HttpReader {
 
 struct ReceiverStream {
     receiver: mpsc::Receiver<Option<Bytes>>,
+    track_internode_metrics: bool,
+    internode_operation: Option<&'static str>,
 }
 
 impl Stream for ReceiverStream {
@@ -264,7 +372,10 @@ impl Stream for ReceiverStream {
         //     }
         // }
         match poll {
-            Poll::Ready(Some(Some(bytes))) => Poll::Ready(Some(Ok(bytes))),
+            Poll::Ready(Some(Some(bytes))) => {
+                record_internode_sent_bytes(self.track_internode_metrics, self.internode_operation, bytes.len());
+                Poll::Ready(Some(Ok(bytes)))
+            }
             Poll::Ready(Some(None)) => Poll::Ready(None), // Sender shutdown
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -278,12 +389,16 @@ pin_project! {
         method: Method,
         headers: HeaderMap,
         err_rx: tokio::sync::oneshot::Receiver<std::io::Error>,
-        sender: tokio::sync::mpsc::Sender<Option<Bytes>>,
+        sender: PollSender<Option<Bytes>>,
         handle: tokio::task::JoinHandle<std::io::Result<()>>,
+        pending_chunk: BytesMut,
         finish:bool,
 
     }
 }
+
+const HTTP_WRITER_CHANNEL_CAPACITY: usize = 8;
+const HTTP_WRITER_BUFFER_SIZE: usize = 1024 * 1024;
 
 impl HttpWriter {
     /// Create a new HttpWriter for the given URL. The HTTP request is performed in the background.
@@ -292,34 +407,24 @@ impl HttpWriter {
         let url_clone = url.clone();
         let method_clone = method.clone();
         let headers_clone = headers.clone();
+        let track_internode_metrics = is_internode_rpc_url(&url);
+        let internode_operation = internode_rpc_operation(&url);
 
-        // First, try to write empty data to check if writable
-        let client = get_http_client();
-        let resp = client.put(&url).headers(headers.clone()).body(Vec::new()).send().await;
-        match resp {
-            Ok(resp) => {
-                // http_log!("[HttpWriter::new] empty PUT status: {}", resp.status());
-                if !resp.status().is_success() {
-                    return Err(Error::other(format!("Empty PUT failed: status {}", resp.status())));
-                }
-            }
-            Err(e) => {
-                // http_log!("[HttpWriter::new] empty PUT error: {e}");
-                return Err(Error::other(format!("Empty PUT failed: {e}")));
-            }
-        }
-
-        let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(8);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(HTTP_WRITER_CHANNEL_CAPACITY);
         let (err_tx, err_rx) = tokio::sync::oneshot::channel::<io::Error>();
 
         let handle = tokio::spawn(async move {
-            let stream = ReceiverStream { receiver };
+            let stream = ReceiverStream {
+                receiver,
+                track_internode_metrics,
+                internode_operation,
+            };
             let body = reqwest::Body::wrap_stream(stream);
             // http_log!(
             //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
             // );
 
-            let client = get_http_client();
+            let client = get_http_client(&url_clone).await;
             let request = client
                 .request(method_clone, url_clone.clone())
                 .headers(headers_clone.clone())
@@ -332,6 +437,7 @@ impl HttpWriter {
                 Ok(resp) => {
                     // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
+                        record_internode_error(track_internode_metrics, internode_operation);
                         let _ = err_tx.send(Error::other(format!(
                             "HttpWriter HTTP request failed with non-200 status {}",
                             resp.status()
@@ -340,6 +446,7 @@ impl HttpWriter {
                     }
                 }
                 Err(e) => {
+                    record_internode_error(track_internode_metrics, internode_operation);
                     // http_log!("[HttpWriter::spawn] HTTP request error: {e}");
                     let _ = err_tx.send(Error::other(format!("HTTP request failed: {e}")));
                     return Err(Error::other(format!("HTTP request failed: {e}")));
@@ -351,13 +458,15 @@ impl HttpWriter {
         });
 
         // http_log!("[HttpWriter::new] connection established successfully");
+        record_internode_outgoing_request(track_internode_metrics, internode_operation);
         Ok(Self {
             url,
             method,
             headers,
             err_rx,
-            sender,
+            sender: PollSender::new(sender),
             handle,
+            pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
             finish: false,
         })
     }
@@ -375,8 +484,105 @@ impl HttpWriter {
     }
 }
 
+fn is_internode_rpc_url(url: &str) -> bool {
+    url.contains("/rustfs/rpc/")
+}
+
+fn internode_rpc_operation(url: &str) -> Option<&'static str> {
+    let url = reqwest::Url::parse(url).ok()?;
+    match url.path() {
+        READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        PUT_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
+        _ => None,
+    }
+}
+
+fn record_internode_outgoing_request(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    match operation {
+        Some(operation) => global_internode_metrics()
+            .record_outgoing_request_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP),
+        None => global_internode_metrics().record_outgoing_request(),
+    }
+}
+
+fn record_internode_sent_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
+    if !track {
+        return;
+    }
+
+    match operation {
+        Some(operation) => global_internode_metrics().record_sent_bytes_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            bytes,
+        ),
+        None => global_internode_metrics().record_sent_bytes(bytes),
+    }
+}
+
+fn record_internode_recv_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
+    if !track {
+        return;
+    }
+
+    match operation {
+        Some(operation) => global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            bytes,
+        ),
+        None => global_internode_metrics().record_recv_bytes(bytes),
+    }
+}
+
+fn record_internode_error(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    match operation {
+        Some(operation) => {
+            global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
+        }
+        None => global_internode_metrics().record_error(),
+    }
+}
+
+fn poll_send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -> io::Error {
+    Error::other(format!("{context}: {err}"))
+}
+
+fn send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -> io::Error {
+    Error::other(format!("{context}: {err}"))
+}
+
+impl HttpWriter {
+    fn poll_send_pending_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.pending_chunk.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.sender.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let chunk = self.pending_chunk.split().freeze();
+                self.sender
+                    .send_item(Some(chunk))
+                    .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(poll_send_error_to_io(e, "HttpWriter send error"))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl AsyncWrite for HttpWriter {
-    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         // http_log!(
         //     "[HttpWriter::poll_write] url: {}, method: {:?}, buf.len: {}",
         //     self.url,
@@ -387,26 +593,104 @@ impl AsyncWrite for HttpWriter {
             return Poll::Ready(Err(e));
         }
 
-        self.sender
-            .try_send(Some(Bytes::copy_from_slice(buf)))
-            .map_err(|e| Error::other(format!("HttpWriter send error: {e}")))?;
+        let this = self.as_mut().get_mut();
+
+        if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
+            match this.poll_send_pending_chunk(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if buf.len() >= HTTP_WRITER_BUFFER_SIZE && this.pending_chunk.is_empty() {
+            match this.sender.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.sender
+                        .send_item(Some(Bytes::copy_from_slice(buf)))
+                        .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
+                    return Poll::Ready(Ok(buf.len()));
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        this.pending_chunk.extend_from_slice(buf);
 
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.as_mut().get_mut().poll_send_pending_chunk(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        if let Ok(e) = Pin::new(&mut self.err_rx).try_recv() {
+            return Poll::Ready(Err(e));
+        }
+
+        let this = self.as_mut().get_mut();
+
+        if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
+            match this.poll_send_pending_chunk(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        let total_len = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+        if total_len == 0 {
+            return Poll::Ready(Ok(0));
+        }
+
+        if bufs.len() == 1 && this.pending_chunk.is_empty() && total_len >= HTTP_WRITER_BUFFER_SIZE {
+            match this.sender.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.sender
+                        .send_item(Some(Bytes::copy_from_slice(bufs[0].as_ref())))
+                        .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
+                    return Poll::Ready(Ok(total_len));
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        for buf in bufs {
+            this.pending_chunk.extend_from_slice(buf);
+        }
+
+        Poll::Ready(Ok(total_len))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         // let url = self.url.clone();
         // let method = self.method.clone();
 
+        match self.as_mut().get_mut().poll_send_pending_chunk(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+
         if !self.finish {
             // http_log!("[HttpWriter::poll_shutdown] url: {}, method: {:?}", url, method);
-            self.sender
-                .try_send(None)
-                .map_err(|e| Error::other(format!("HttpWriter shutdown error: {e}")))?;
+            let this = self.as_mut().get_mut();
+            match this.sender.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.sender
+                        .send_item(None)
+                        .map_err(|e| send_error_to_io(e, "HttpWriter shutdown error"))?;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter shutdown error"))),
+                Poll::Pending => return Poll::Pending,
+            }
             // http_log!(
             //     "[HttpWriter::poll_shutdown] sent shutdown signal to HTTP request, url: {}, method: {:?}",
             //     url,
@@ -417,7 +701,7 @@ impl AsyncWrite for HttpWriter {
         }
         // Wait for the HTTP request to complete
         use futures::FutureExt;
-        match Pin::new(&mut self.get_mut().handle).poll_unpin(_cx) {
+        match Pin::new(&mut self.get_mut().handle).poll_unpin(cx) {
             Poll::Ready(Ok(_)) => {
                 // http_log!(
                 //     "[HttpWriter::poll_shutdown] HTTP request finished successfully, url: {}, method: {:?}",
@@ -439,77 +723,210 @@ impl AsyncWrite for HttpWriter {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use reqwest::Method;
-//     use std::vec;
-//     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, body::Body, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+    use futures::stream::{self, StreamExt as _};
+    use http_body_util::BodyExt as _;
+    use std::io::{self, IoSlice};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::Mutex,
+    };
 
-//     #[tokio::test]
-//     async fn test_http_writer_err() {
-//         // Use a real local server for integration, or mockito for unit test
-//         // Here, we use the Go test server at 127.0.0.1:8081 (scripts/testfile.go)
-//         let url = "http://127.0.0.1:8081/testfile".to_string();
-//         let data = vec![42u8; 8];
+    #[derive(Clone, Default)]
+    struct TestState {
+        head_count: Arc<AtomicUsize>,
+        get_count: Arc<AtomicUsize>,
+        put_count: Arc<AtomicUsize>,
+        put_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
 
-//         // Write
-//         // Add header X-Deny-Write = 1 to simulate non-writable situation
-//         let mut headers = HeaderMap::new();
-//         headers.insert("X-Deny-Write", "1".parse().unwrap());
-//         // Here we use PUT method
-//         let writer_result = HttpWriter::new(url.clone(), Method::PUT, headers).await;
-//         match writer_result {
-//             Ok(mut writer) => {
-//                 // If creation succeeds, write should fail
-//                 let write_result = writer.write_all(&data).await;
-//                 assert!(write_result.is_err(), "write_all should fail when server denies write");
-//                 if let Err(e) = write_result {
-//                     println!("write_all error: {e}");
-//                 }
-//                 let shutdown_result = writer.shutdown().await;
-//                 if let Err(e) = shutdown_result {
-//                     println!("shutdown error: {e}");
-//                 }
-//             }
-//             Err(e) => {
-//                 // Direct construction failure is also acceptable
-//                 println!("HttpWriter::new error: {e}");
-//                 assert!(
-//                     e.to_string().contains("Empty PUT failed") || e.to_string().contains("Forbidden"),
-//                     "unexpected error: {e}"
-//                 );
-//                 return;
-//             }
-//         }
-//         // Should not reach here
-//         panic!("HttpWriter should not allow writing when server denies write");
-//     }
+    async fn get_stream(State(state): State<TestState>) -> impl IntoResponse {
+        state.get_count.fetch_add(1, Ordering::SeqCst);
+        (StatusCode::OK, Body::from("hello"))
+    }
 
-//     #[tokio::test]
-//     async fn test_http_writer_and_reader_ok() {
-//         // Use local Go test server
-//         let url = "http://127.0.0.1:8081/testfile".to_string();
-//         let data = vec![99u8; 512 * 1024]; // 512KB of data
+    async fn get_stalling_stream(State(state): State<TestState>) -> impl IntoResponse {
+        state.get_count.fetch_add(1, Ordering::SeqCst);
+        let body_stream = stream::once(async { Ok::<Bytes, io::Error>(Bytes::from_static(b"hello")) }).chain(stream::pending());
+        (StatusCode::OK, Body::from_stream(body_stream))
+    }
 
-//         // Write (without X-Deny-Write)
-//         let headers = HeaderMap::new();
-//         let mut writer = HttpWriter::new(url.clone(), Method::PUT, headers).await.unwrap();
-//         writer.write_all(&data).await.unwrap();
-//         writer.shutdown().await.unwrap();
+    async fn reject_head(State(state): State<TestState>) -> impl IntoResponse {
+        state.head_count.fetch_add(1, Ordering::SeqCst);
+        StatusCode::METHOD_NOT_ALLOWED
+    }
 
-//         http_log!("Wrote {} bytes to {} (ok case)", data.len(), url);
+    async fn accept_put(State(state): State<TestState>, body: Body) -> impl IntoResponse {
+        state.put_count.fetch_add(1, Ordering::SeqCst);
+        let bytes = body.collect().await.unwrap().to_bytes();
+        state.put_bodies.lock().await.push(bytes.to_vec());
+        StatusCode::OK
+    }
 
-//         // Read back
-//         let mut reader = HttpReader::with_capacity(url.clone(), Method::GET, HeaderMap::new(), 8192)
-//             .await
-//             .unwrap();
-//         let mut buf = Vec::new();
-//         reader.read_to_end(&mut buf).await.unwrap();
-//         assert_eq!(buf, data);
+    async fn start_test_server(state: TestState) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .route("/stall", get(get_stalling_stream))
+            .with_state(state);
 
-//         // println!("Read {} bytes from {} (ok case)", buf.len(), url);
-//         // tokio::time::sleep(std::time::Duration::from_secs(2)).await; // Wait for server to process
-//         // println!("[test_http_writer_and_reader_ok] completed successfully");
-//     }
-// }
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{addr}/stream"), handle)
+    }
+
+    #[test]
+    fn internode_rpc_operation_maps_known_routes() {
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{READ_FILE_STREAM_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM)
+        );
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{PUT_FILE_STREAM_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM)
+        );
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{WALK_DIR_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_WALK_DIR)
+        );
+        assert_eq!(internode_rpc_operation("http://node:9000/rustfs/rpc/unknown"), None);
+        assert_eq!(
+            internode_rpc_operation("http://node:9000/rustfs/rpc/unknown?next=/rustfs/rpc/read_file_stream"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn http_reader_does_not_send_preflight_head() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await;
+
+        let mut reader = HttpReader::new(url, Method::GET, HeaderMap::new(), None).await.unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, b"hello");
+        assert_eq!(state.head_count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.get_count.load(Ordering::SeqCst), 1);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_reader_stall_timeout_triggers_after_progress_stops() {
+        let state = TestState::default();
+        let (base_url, handle) = start_test_server(state.clone()).await;
+        let url = base_url.replace("/stream", "/stall");
+
+        let mut reader =
+            HttpReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, Some(Duration::from_millis(20)))
+                .await
+                .unwrap();
+
+        let mut first = [0u8; 5];
+        reader.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"hello");
+
+        let mut next = [0u8; 1];
+        let read_result = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut next))
+            .await
+            .expect("stall timeout should wake reader");
+        let err = match read_result {
+            Ok(_) => panic!("reader should return a timeout error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_does_not_send_empty_preflight_put() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await;
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        writer.write_all(b"payload").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"payload".to_vec()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_handles_many_small_writes() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await;
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        let chunk = b"0123456789abcdef";
+        let mut expected = Vec::new();
+        for _ in 0..256 {
+            writer.write_all(chunk).await.unwrap();
+            expected.extend_from_slice(chunk);
+        }
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[expected]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_supports_vectored_writes() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await;
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        let bufs = [IoSlice::new(b"hello "), IoSlice::new(b"world")];
+        let written = writer.write_vectored(&bufs).await.unwrap();
+        assert_eq!(written, 11);
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"hello world".to_vec()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_reader_request_error_includes_method_and_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let url = format!("http://{addr}/stream");
+        let err = match HttpReader::new(url.clone(), Method::GET, HeaderMap::new(), None).await {
+            Ok(_) => panic!("closed listener should trigger request error"),
+            Err(err) => err,
+        };
+
+        let err_text = err.to_string();
+        assert!(err_text.contains("HttpReader HTTP request error for GET"));
+        assert!(err_text.contains(&url));
+    }
+
+    #[test]
+    fn loopback_urls_bypass_proxy_selection() {
+        assert!(should_bypass_proxy_for_url("http://127.0.0.1:9000/stream"));
+        assert!(should_bypass_proxy_for_url("http://localhost:9000/stream"));
+        assert!(should_bypass_proxy_for_url("http://[::1]:9000/stream"));
+        assert!(!should_bypass_proxy_for_url("http://192.168.1.10:9000/stream"));
+        assert!(!should_bypass_proxy_for_url("http://example.com/stream"));
+        assert!(!should_bypass_proxy_for_url("not-a-url"));
+    }
+}

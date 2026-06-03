@@ -22,15 +22,23 @@ use super::constants::UNSIGNED_PAYLOAD;
 use super::credentials::SignatureType;
 use crate::client::{
     api_error_response::http_resp_to_error_response,
+    signer_error,
     transition_api::{CreateBucketConfiguration, LocationConstraint, TransitionClient},
 };
 use http::Request;
+use http_body_util::BodyExt;
 use hyper::StatusCode;
+use hyper::body::Body;
+use hyper::body::Bytes;
+use hyper::body::Incoming;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
-use s3s::Body;
 use s3s::S3ErrorCode;
 use std::collections::HashMap;
+
+fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> std::io::Error {
+    signer_error::signer_error_to_io_error(scope, error)
+}
 
 #[derive(Debug, Clone)]
 pub struct BucketLocationCache {
@@ -67,10 +75,10 @@ impl TransitionClient {
 
         let mut location;
         {
-            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-            let ret = bucket_loc_cache.get(bucket_name);
-            if let Some(location) = ret {
-                return Ok(location);
+            if let Ok(bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                if let Some(location) = bucket_loc_cache.get(bucket_name) {
+                    return Ok(location);
+                }
             }
             //location = ret?;
         }
@@ -80,13 +88,14 @@ impl TransitionClient {
         let mut resp = self.doit(req).await?;
         location = process_bucket_location_response(resp, bucket_name, &self.tier_type).await?;
         {
-            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-            bucket_loc_cache.set(bucket_name, &location);
+            if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                bucket_loc_cache.set(bucket_name, &location);
+            }
         }
         Ok(location)
     }
 
-    fn get_bucket_location_request(&self, bucket_name: &str) -> Result<http::Request<Body>, std::io::Error> {
+    fn get_bucket_location_request(&self, bucket_name: &str) -> Result<http::Request<s3s::Body>, std::io::Error> {
         let mut url_values = HashMap::new();
         url_values.insert("location".to_string(), "".to_string());
 
@@ -105,7 +114,11 @@ impl TransitionClient {
             url_str.push_str("://");
             url_str.push_str(bucket_name);
             url_str.push_str(".");
-            url_str.push_str(target_url.host_str().expect("err"));
+            url_str.push_str(
+                target_url
+                    .host_str()
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "host is none"))?,
+            );
             url_str.push_str("/?location");
         } else {
             let mut path = bucket_name.to_string();
@@ -120,7 +133,11 @@ impl TransitionClient {
             url_str = target_url.to_string();
         }
 
-        let Ok(mut req) = Request::builder().method(http::Method::GET).uri(url_str).body(Body::empty()) else {
+        let Ok(mut req) = Request::builder()
+            .method(http::Method::GET)
+            .uri(url_str)
+            .body(s3s::Body::empty())
+        else {
             return Err(std::io::Error::other("create request error"));
         };
 
@@ -128,13 +145,16 @@ impl TransitionClient {
 
         let value;
         {
-            let mut creds_provider = self.creds_provider.lock().unwrap();
-            value = match creds_provider.get_with_context(Some(self.cred_context())) {
-                Ok(v) => v,
-                Err(err) => {
-                    return Err(std::io::Error::other(err));
-                }
-            };
+            if let Ok(mut creds_provider) = self.creds_provider.lock() {
+                value = match creds_provider.get_with_context(Some(self.cred_context())) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Err(std::io::Error::other(err));
+                    }
+                };
+            } else {
+                return Err(std::io::Error::other("Failed to acquire credentials provider lock"));
+            }
         }
 
         let mut signer_type = value.signer_type.clone();
@@ -164,21 +184,30 @@ impl TransitionClient {
             content_sha256 = UNSIGNED_PAYLOAD.to_string();
         }
 
-        req.headers_mut()
-            .insert("X-Amz-Content-Sha256", content_sha256.parse().unwrap());
-        let req = rustfs_signer::sign_v4(req, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
+        let content_sha256_value = content_sha256.parse().map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid X-Amz-Content-Sha256 header value: {err}"),
+            )
+        })?;
+        req.headers_mut().insert("X-Amz-Content-Sha256", content_sha256_value);
+        let req = rustfs_signer::try_sign_v4(req, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1")
+            .map_err(|err| signer_error_to_io_error("failed to sign bucket location request", err))?;
         Ok(req)
     }
 }
 
 async fn process_bucket_location_response(
-    mut resp: http::Response<Body>,
+    mut resp: http::Response<Incoming>,
     bucket_name: &str,
     tier_type: &str,
 ) -> Result<String, std::io::Error> {
     //if resp != nil {
     if resp.status() != StatusCode::OK {
-        let err_resp = http_resp_to_error_response(&resp, vec![], bucket_name, "");
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
+        let err_resp = http_resp_to_error_response(resp_status, &h, vec![], bucket_name, "");
         match err_resp.code {
                 S3ErrorCode::NotImplemented => {
                     match err_resp.server.as_str() {
@@ -208,19 +237,26 @@ async fn process_bucket_location_response(
     }
     //}
 
-    let b = resp
-        .body_mut()
-        .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
-        .await
-        .unwrap()
-        .to_vec();
+    let mut body_vec = Vec::new();
+    let mut body = resp.into_body();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        if let Some(data) = frame.data_ref() {
+            body_vec.extend_from_slice(data);
+        }
+    }
     let mut location = "".to_string();
     if tier_type == "huaweicloud" {
-        let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(b).unwrap()).unwrap();
-        location = d.location_constraint;
+        if let Ok(body_str) = String::from_utf8(body_vec) {
+            if let Ok(d) = quick_xml::de::from_str::<CreateBucketConfiguration>(&body_str) {
+                location = d.location_constraint;
+            }
+        }
     } else {
-        if let Ok(LocationConstraint { field }) = quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(b).unwrap()) {
-            location = field;
+        if let Ok(body_str) = String::from_utf8(body_vec) {
+            if let Ok(LocationConstraint { field }) = quick_xml::de::from_str::<LocationConstraint>(&body_str) {
+                location = field;
+            }
         }
     }
     //debug!("location: {}", location);

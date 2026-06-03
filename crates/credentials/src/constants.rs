@@ -27,11 +27,11 @@ pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 /// Example: --secret-key rustfsadmin
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
-/// Environment variable for gRPC authentication token
-/// Used to set the authentication token for gRPC communication
-/// Example: RUSTFS_GRPC_AUTH_TOKEN=your_token_here
+/// Environment variable for RPC authentication token
+/// Used to set the authentication token for RPC communication
+/// Example: RUSTFS_RPC_SECRET=your_token_here
 /// Default value: No default value. RUSTFS_SECRET_KEY value is recommended.
-pub const ENV_GRPC_AUTH_TOKEN: &str = "RUSTFS_GRPC_AUTH_TOKEN";
+pub const ENV_RPC_SECRET: &str = "RUSTFS_RPC_SECRET";
 
 /// IAM Policy Types
 /// Used to differentiate between embedded and inherited policies
@@ -66,7 +66,7 @@ mod tests {
 
         // In production environment, access key and secret key should be different
         // These are default values, so being the same is acceptable, but should be warned in documentation
-        println!("Warning: Default access key and secret key are the same. Change them in production!");
+        assert_eq!(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY);
     }
 
     #[test]
@@ -74,10 +74,8 @@ mod tests {
         // Test security best practices
 
         // These are default values, should be changed in production environments
-        println!("Security Warning: Default credentials detected!");
-        println!("Access Key: {DEFAULT_ACCESS_KEY}");
-        println!("Secret Key: {DEFAULT_SECRET_KEY}");
-        println!("These should be changed in production environments!");
+        assert_eq!(DEFAULT_ACCESS_KEY, "rustfsadmin");
+        assert_eq!(DEFAULT_SECRET_KEY, "rustfsadmin");
 
         // Verify that key lengths meet minimum security requirements
         assert!(DEFAULT_ACCESS_KEY.len() >= 8, "Access key should be at least 8 characters");

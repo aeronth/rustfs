@@ -18,12 +18,15 @@ use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
+use crate::rpc::client::{
+    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
+};
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
     disk::{
         self, VolumeInfo,
-        disk_store::{CHECK_EVERY, CHECK_TIMEOUT_DURATION, DiskHealthTracker},
+        disk_store::{DiskHealthTracker, get_drive_active_check_interval, get_drive_active_check_timeout},
     },
     endpoints::{EndpointServerPools, Node},
     store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
@@ -32,7 +35,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use rustfs_common::heal_channel::{DriveState, HealItemType, HealOpts, RUSTFS_RESERVED_BUCKET};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_protos::node_service_time_out_client;
+use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_protos::proto_gen::node_service::{
     DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
 };
@@ -40,9 +43,37 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, sync::RwLock, time};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
+
+fn pool_participant_errors(clients: &[Client], errors: &[Option<Error>], pool_idx: usize) -> Vec<Option<Error>> {
+    clients
+        .iter()
+        .zip(errors.iter())
+        .filter_map(|(client, err)| {
+            if client.get_pools().unwrap_or_default().contains(&pool_idx) {
+                Some(err.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn pool_write_quorum(participant_count: usize) -> usize {
+    (participant_count / 2) + 1
+}
+
+fn reduce_pool_write_quorum_errs(per_pool_errs: &[Option<Error>]) -> Option<Error> {
+    if per_pool_errs.is_empty() {
+        return Some(Error::ErasureWriteQuorum);
+    }
+
+    reduce_write_quorum_errs(per_pool_errs, BUCKET_OP_IGNORED_ERRS, pool_write_quorum(per_pool_errs.len()))
+}
 
 #[async_trait]
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
@@ -101,10 +132,10 @@ impl S3PeerSys {
         for pool_idx in 0..self.pools_count {
             let mut per_pool_errs = vec![None; self.clients.len()];
             for (i, client) in self.clients.iter().enumerate() {
-                if let Some(v) = client.get_pools() {
-                    if v.contains(&pool_idx) {
-                        per_pool_errs[i] = errs[i].clone();
-                    }
+                if let Some(v) = client.get_pools()
+                    && v.contains(&pool_idx)
+                {
+                    per_pool_errs[i] = errs[i].clone();
                 }
             }
             let qu = per_pool_errs.len() / 2;
@@ -136,10 +167,10 @@ impl S3PeerSys {
         for pool_idx in 0..self.pools_count {
             let mut per_pool_errs = vec![None; self.clients.len()];
             for (i, client) in self.clients.iter().enumerate() {
-                if let Some(v) = client.get_pools() {
-                    if v.contains(&pool_idx) {
-                        per_pool_errs[i] = errs[i].clone();
-                    }
+                if let Some(v) = client.get_pools()
+                    && v.contains(&pool_idx)
+                {
+                    per_pool_errs[i] = errs[i].clone();
                 }
             }
             let qu = per_pool_errs.len() / 2;
@@ -185,18 +216,8 @@ impl S3PeerSys {
         }
 
         for i in 0..self.pools_count {
-            let mut per_pool_errs = vec![None; self.clients.len()];
-            for (j, cli) in self.clients.iter().enumerate() {
-                let pools = cli.get_pools();
-                let idx = i;
-                if pools.unwrap_or_default().contains(&idx) {
-                    per_pool_errs[j] = errors[j].clone();
-                }
-            }
-
-            if let Some(pool_err) =
-                reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, (per_pool_errs.len() / 2) + 1)
-            {
+            let per_pool_errs = pool_participant_errors(&self.clients, &errors, i);
+            if let Some(pool_err) = reduce_pool_write_quorum_errs(&per_pool_errs) {
                 tracing::error!("make_bucket per_pool_errs: {per_pool_errs:?}");
                 tracing::error!("make_bucket reduce_write_quorum_errs: {pool_err}");
                 return Err(pool_err);
@@ -354,12 +375,12 @@ impl S3PeerSys {
 
         ress.into_iter()
             .filter(|op| op.is_some())
-            .find_map(|op| op.clone())
+            .find_map(|op| op)
             .ok_or(Error::VolumeNotFound)
     }
 
     pub fn get_pools(&self) -> Option<Vec<usize>> {
-        unimplemented!()
+        None
     }
 }
 
@@ -572,7 +593,7 @@ pub struct RemotePeerS3Client {
 
 impl RemotePeerS3Client {
     pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
-        let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default().to_string();
+        let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default();
         let client = Self {
             node,
             pools,
@@ -585,6 +606,12 @@ impl RemotePeerS3Client {
         client.start_health_monitoring();
 
         client
+    }
+
+    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+            .await
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
     }
 
     pub fn get_addr(&self) -> String {
@@ -604,7 +631,7 @@ impl RemotePeerS3Client {
 
     /// Monitor remote peer health periodically
     async fn monitor_remote_peer_health(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
-        let mut interval = time::interval(CHECK_EVERY);
+        let mut interval = time::interval(get_drive_active_check_interval());
 
         loop {
             tokio::select! {
@@ -664,7 +691,7 @@ impl RemotePeerS3Client {
     async fn perform_connectivity_check(addr: &str) -> Result<()> {
         use tokio::time::timeout;
 
-        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {}", e)))?;
+        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {e}")))?;
 
         let Some(host) = url.host_str() else {
             return Err(Error::other("No host in URL".to_string()));
@@ -673,9 +700,9 @@ impl RemotePeerS3Client {
         let port = url.port_or_known_default().unwrap_or(80);
 
         // Try to establish TCP connection
-        match timeout(CHECK_TIMEOUT_DURATION, TcpStream::connect((host, port))).await {
+        match timeout(get_drive_active_check_timeout(), TcpStream::connect((host, port))).await {
             Ok(Ok(_)) => Ok(()),
-            _ => Err(Error::other(format!("Cannot connect to {}:{}", host, port))),
+            _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
         }
     }
 
@@ -708,14 +735,37 @@ impl RemotePeerS3Client {
                     self.health.log_success();
                 }
                 self.health.decrement_waiting();
+                if let Err(err) = &operation_result
+                    && is_network_like_disk_error(err)
+                {
+                    self.mark_faulty_and_start_recovery("operation_network_error").await;
+                }
                 operation_result
             }
             Err(_) => {
                 // Timeout occurred, mark peer as potentially faulty
                 self.health.decrement_waiting();
+                self.mark_faulty_and_start_recovery("operation_timeout").await;
                 warn!("Remote peer operation timeout after {:?}", timeout_duration);
-                Err(Error::other(format!("Remote peer operation timeout after {:?}", timeout_duration)))
+                Err(Error::other(format!("Remote peer operation timeout after {timeout_duration:?}")))
             }
+        }
+    }
+
+    async fn mark_faulty_and_start_recovery(&self, reason: &'static str) {
+        if self.health.swap_ok_to_faulty() {
+            warn!(
+                addr = %self.addr,
+                reason,
+                "Remote peer marked faulty after network failure"
+            );
+
+            let health = Arc::clone(&self.health);
+            let cancel_token = self.cancel_token.clone();
+            let addr = self.addr.clone();
+            tokio::spawn(async move {
+                Self::monitor_remote_peer_recovery(addr, health, cancel_token).await;
+            });
         }
     }
 }
@@ -730,9 +780,7 @@ impl PeerS3Client for RemotePeerS3Client {
         self.execute_with_timeout(
             || async {
                 let options: String = serde_json::to_string(opts)?;
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(HealBucketRequest {
                     bucket: bucket.to_string(),
                     options,
@@ -762,9 +810,7 @@ impl PeerS3Client for RemotePeerS3Client {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(opts)?;
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(ListBucketRequest { options });
                 let response = client.list_bucket(request).await?.into_inner();
                 if !response.success {
@@ -790,21 +836,20 @@ impl PeerS3Client for RemotePeerS3Client {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(opts)?;
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(MakeBucketRequest {
                     name: bucket.to_string(),
                     options,
                 });
                 let response = client.make_bucket(request).await?.into_inner();
 
-                // TODO: deal with error
                 if !response.success {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(Error::other(format!(
+                            "make_bucket({bucket}): peer returned failure without error details"
+                        )))
                     };
                 }
 
@@ -818,9 +863,7 @@ impl PeerS3Client for RemotePeerS3Client {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(opts)?;
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(GetBucketInfoRequest {
                     bucket: bucket.to_string(),
                     options,
@@ -845,9 +888,7 @@ impl PeerS3Client for RemotePeerS3Client {
     async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
 
                 let request = Request::new(DeleteBucketRequest {
                     bucket: bucket.to_string(),
@@ -1001,4 +1042,276 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
 
 async fn clone_drives() -> Vec<Option<DiskStore>> {
     GLOBAL_LOCAL_DISK_MAP.read().await.values().cloned().collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::WalkDirOptions;
+    use crate::disk::disk_store::LocalDiskWrapper;
+    use crate::disk::endpoint::Endpoint;
+    use crate::disk::local::LocalDisk;
+    use crate::endpoints::{Endpoints, PoolEndpoints};
+    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
+    use crate::store::init_local_disks;
+    use rustfs_filemeta::FileInfo;
+    use serial_test::serial;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tempfile::TempDir;
+    use tokio::io::AsyncWrite;
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn reset_local_disk_globals() {
+        GLOBAL_LOCAL_DISK_MAP.write().await.clear();
+        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+        GLOBAL_LOCAL_DISK_SET_DRIVES.write().await.clear();
+    }
+
+    #[derive(Debug)]
+    struct TestPeerS3Client {
+        pools: Option<Vec<usize>>,
+        make_bucket_result: Result<()>,
+    }
+
+    #[async_trait]
+    impl PeerS3Client for TestPeerS3Client {
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
+            unreachable!("not used by quorum tests")
+        }
+
+        async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
+            self.make_bucket_result.clone()
+        }
+
+        async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+            unreachable!("not used by quorum tests")
+        }
+
+        async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+            unreachable!("not used by quorum tests")
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+            unreachable!("not used by quorum tests")
+        }
+
+        fn get_pools(&self) -> Option<Vec<usize>> {
+            self.pools.clone()
+        }
+    }
+
+    fn test_peer(pools: &[usize]) -> Client {
+        test_peer_with_make_bucket(pools, Ok(()))
+    }
+
+    fn test_peer_with_make_bucket(pools: &[usize], make_bucket_result: Result<()>) -> Client {
+        Arc::new(Box::new(TestPeerS3Client {
+            pools: Some(pools.to_vec()),
+            make_bucket_result,
+        }))
+    }
+
+    fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
+        let node = Node {
+            url: url::Url::parse(addr).expect("test peer URL should parse"),
+            pools: vec![0],
+            is_local: false,
+            grid_host: addr.to_string(),
+        };
+
+        RemotePeerS3Client {
+            node: Some(node),
+            pools: Some(vec![0]),
+            addr: addr.to_string(),
+            health: Arc::new(DiskHealthTracker::new()),
+            cancel_token: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_marks_remote_peer_faulty_on_network_like_error() {
+        let client = test_remote_peer("http://peer-network-error:9000");
+
+        let err = client
+            .execute_with_timeout(
+                || async {
+                    Err::<(), Error>(DiskError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    )))
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("network-like error should fail");
+
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io network error, got {other:?}"),
+            },
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert!(client.health.is_faulty(), "network-like errors should mark remote peer faulty");
+
+        client.cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_keeps_remote_peer_online_for_business_error() {
+        let client = test_remote_peer("http://peer-business-error:9000");
+
+        let err = client
+            .execute_with_timeout(|| async { Err::<(), Error>(DiskError::FileNotFound) }, Duration::from_secs(1))
+            .await
+            .expect_err("business error should fail");
+
+        assert_eq!(err, DiskError::FileNotFound);
+        assert!(!client.health.is_faulty(), "business errors should not mark remote peer faulty");
+
+        client.cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_get_bucket_info_survives_prior_walk_timeout() {
+        reset_local_disk_globals().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for local peer listing regression");
+        let disk_path = temp_dir.path().join("disk1");
+        std::fs::create_dir_all(&disk_path).expect("create disk path");
+
+        let mut endpoint = Endpoint::try_from(disk_path.to_str().expect("disk path to str")).expect("endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![endpoint.clone()]),
+            cmd_line: "local-get-bucket-info-survives-prior-walk-timeout".to_string(),
+            platform: "test".to_string(),
+        }]);
+
+        init_local_disks(endpoint_pools).await.expect("init local disks");
+
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = crate::disk::Disk::Local(Box::new(LocalDiskWrapper::new(disk, false)));
+        let disk_store: DiskStore = Arc::new(wrapper);
+        let bucket = "test-bucket";
+        let object = "test-object";
+
+        disk_store.make_volume(bucket).await.expect("bucket should be created");
+
+        let mut file_info = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+        file_info.volume = bucket.to_string();
+        file_info.name = object.to_string();
+        file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+        file_info.erasure.index = 1;
+
+        disk_store
+            .write_metadata("", bucket, object, file_info)
+            .await
+            .expect("object metadata should be written");
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
+            let mut writer = PendingWriter;
+            let walk_err = disk_store
+                .walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        ..Default::default()
+                    },
+                    &mut writer,
+                )
+                .await
+                .expect_err("walk_dir should time out against a non-draining writer");
+
+            assert_eq!(walk_err, DiskError::Timeout);
+
+            let info = LocalPeerS3Client::new(None, Some(vec![0]))
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .expect("bucket info should still succeed after prior walk timeout");
+            assert_eq!(info.name, bucket);
+        })
+        .await;
+
+        reset_local_disk_globals().await;
+    }
+
+    #[test]
+    fn test_reduce_pool_write_quorum_uses_only_pool_participants() {
+        let clients = vec![
+            test_peer(&[0]),
+            test_peer(&[0]),
+            test_peer(&[0]),
+            test_peer(&[0]),
+            test_peer(&[1]),
+            test_peer(&[1]),
+            test_peer(&[1]),
+            test_peer(&[1]),
+        ];
+        let errors = vec![
+            Some(Error::VolumeExists),
+            Some(Error::VolumeExists),
+            Some(Error::VolumeExists),
+            Some(Error::VolumeExists),
+            None,
+            None,
+            None,
+            None,
+        ];
+
+        let per_pool_errs = pool_participant_errors(&clients, &errors, 0);
+        let err = reduce_pool_write_quorum_errs(&per_pool_errs).expect("all pool participants returned VolumeExists");
+
+        assert_eq!(err, Error::VolumeExists);
+    }
+
+    #[tokio::test]
+    async fn test_make_bucket_reduces_quorum_by_pool_participants() {
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer(&[1]),
+                test_peer(&[1]),
+                test_peer(&[1]),
+                test_peer(&[1]),
+            ],
+            pools_count: 2,
+        };
+
+        let err = peer_sys
+            .make_bucket("existing-bucket", &MakeBucketOptions::default())
+            .await
+            .expect_err("existing bucket should surface as VolumeExists, not quorum failure");
+
+        assert_eq!(err, Error::VolumeExists);
+    }
 }

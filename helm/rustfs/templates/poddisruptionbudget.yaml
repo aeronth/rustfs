@@ -4,6 +4,7 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: {{ include "rustfs.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
     {{- with .Values.commonLabels }}
@@ -13,7 +14,7 @@ spec:
   {{- if .Values.pdb.minAvailable }}
   minAvailable: {{ .Values.pdb.minAvailable }}
   {{- end }}
-  {{- if or .Values.pdb.maxUnavailable (not .Values.pdb.minAvailable) }}
+  {{- if and .Values.pdb.maxUnavailable (not .Values.pdb.minAvailable) }}
   maxUnavailable: {{ .Values.pdb.maxUnavailable }}
   {{- end }}
   selector:

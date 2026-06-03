@@ -14,9 +14,10 @@
 
 use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend};
 use crate::error::{Error, Result};
+use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::{
     disk::endpoint::Endpoint,
-    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints},
+    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints, get_global_deployment_id},
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     store_api::StorageAPI,
@@ -29,7 +30,6 @@ use rustfs_madmin::{
 };
 use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
-    node_service_time_out_client,
     proto_gen::node_service::{PingRequest, PingResponse},
 };
 use std::{
@@ -101,9 +101,9 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
         let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
         assert!(decoded_payload.is_ok());
 
-        let mut client = node_service_time_out_client(&addr)
+        let mut client = node_service_time_out_client(&addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
-            .map_err(|err| Error::other(err.to_string()))?;
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
 
         let request = Request::new(PingRequest {
             version: 1,
@@ -162,8 +162,9 @@ pub async fn get_local_server_property() -> ServerProperties {
 
     let mut props = ServerProperties {
         endpoint: addr,
-        uptime: SystemTime::now()
-            .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
+        uptime: GLOBAL_BOOT_TIME
+            .get()
+            .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
             .unwrap_or_default()
             .as_secs(),
         network,
@@ -182,11 +183,8 @@ pub async fn get_local_server_property() -> ServerProperties {
     };
 
     // let mut sensitive = HashSet::new();
-    // sensitive.insert(ENV_ACCESS_KEY.to_string());
-    // sensitive.insert(ENV_SECRET_KEY.to_string());
-    // sensitive.insert(ENV_ROOT_USER.to_string());
-    // sensitive.insert(ENV_ROOT_PASSWORD.to_string());
-
+    // sensitive.insert(rustfs_config::ENV_RUSTFS_ACCESS_KEY.to_string());
+    // sensitive.insert(rustfs_config::ENV_RUSTFS_SECRET_KEY.to_string());
     if let Some(store) = new_object_layer_fn() {
         let storage_info = store.local_storage_info().await;
         props.state = ITEM_ONLINE.to_string();
@@ -293,7 +291,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         domain: None,
         region: None,
         sqs_arn: None,
-        deployment_id: None,
+        deployment_id: get_global_deployment_id(),
         buckets: Some(buckets),
         objects: Some(objects),
         versions: Some(versions),
@@ -394,4 +392,22 @@ pub fn get_commit_id() -> String {
     };
 
     format!("{}@{}", build::COMMIT_DATE_3339, ver)
+}
+
+#[cfg(test)]
+mod tests {
+    use serial_test::serial;
+
+    use crate::global::get_global_deployment_id;
+
+    use super::get_server_info;
+
+    #[serial]
+    #[tokio::test]
+    async fn server_info_includes_global_deployment_id() {
+        let expected_deployment_id = get_global_deployment_id();
+        let info = get_server_info(false).await;
+
+        assert_eq!(info.deployment_id, expected_deployment_id);
+    }
 }

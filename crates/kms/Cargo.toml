@@ -30,9 +30,9 @@ workspace = true
 [dependencies]
 # Core dependencies
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full","io-uring"] }
 uuid = { workspace = true, features = ["serde"] }
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -55,6 +55,8 @@ moka = { workspace = true, features = ["future"] }
 
 # Additional dependencies
 md5 = { workspace = true }
+arc-swap = { workspace = true }
+rustfs-utils = { workspace = true }
 
 # HTTP client for Vault
 reqwest = { workspace = true }
@@ -62,6 +64,7 @@ vaultrs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+temp-env = { workspace = true }
 
 [features]
 default = []

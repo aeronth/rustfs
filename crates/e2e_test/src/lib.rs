@@ -29,6 +29,25 @@ mod data_usage_test;
 #[cfg(test)]
 mod kms;
 
+// Regression test for issue #1797
+#[cfg(test)]
+mod list_objects_duplicates_test;
+
+// Quota tests
+#[cfg(test)]
+mod quota_test;
+
+#[cfg(test)]
+mod bucket_policy_check_test;
+
+/// IAM / bucket / STS session policy with `s3:ExistingObjectTag` conditions (E2E).
+#[cfg(test)]
+mod existing_object_tag_policy_test;
+
+// Regression tests for Issue #2036: anonymous access with PublicAccessBlock
+#[cfg(test)]
+mod anonymous_access_test;
+
 // Special characters in path test modules
 #[cfg(test)]
 mod special_chars_test;
@@ -37,9 +56,97 @@ mod special_chars_test;
 #[cfg(test)]
 mod content_encoding_test;
 
+#[cfg(test)]
+mod archive_download_integrity_test;
+
+// ListObjectsV2 pagination test (Issue #1596)
+#[cfg(test)]
+mod list_objects_v2_pagination_test;
+
+// Regression test for Issue #3107: mc mirror small-bucket listing must not time out.
+#[cfg(test)]
+mod mc_mirror_small_bucket_test;
+
 // Policy variables tests
 #[cfg(test)]
 mod policy;
 
 #[cfg(test)]
+mod compression_test;
+
+// Regression test for Issue #1878: DeleteMarkers not visible immediately after delete_objects
+#[cfg(test)]
+mod delete_objects_versioning_test;
+
+// Regression test for signed DELETE Object?versionId requests without Content-Length.
+#[cfg(test)]
+mod delete_object_no_content_length_test;
+
+// Regression test for Issue #2252: ListObjectVersions misses newest version after put -> delete -> put
+#[cfg(test)]
+mod list_object_versions_regression_test;
+
+// versions&metadata=true extension regression test
+#[cfg(test)]
+mod list_object_versions_metadata_extension_test;
+
+// list-type=2&metadata=true extension regression test
+#[cfg(test)]
+mod list_objects_v2_metadata_extension_test;
+
+#[cfg(test)]
 mod protocols;
+
+// Object Lock tests
+#[cfg(test)]
+mod object_lock;
+
+#[cfg(test)]
+mod cluster_concurrency_test;
+
+// PutObject / MultipartUpload with checksum (Content-MD5, x-amz-checksum-*)
+#[cfg(test)]
+mod checksum_upload_test;
+
+// Group deletion tests
+#[cfg(test)]
+mod group_delete_test;
+
+#[cfg(test)]
+mod head_object_range_test;
+
+#[cfg(test)]
+mod head_object_consistency_test;
+
+#[cfg(test)]
+mod heal_erasure_disk_rebuild_test;
+
+#[cfg(test)]
+mod copy_object_metadata_test;
+
+// S3 dummy-compat bucket API tests
+#[cfg(test)]
+mod bucket_logging_test;
+
+// Multipart control API auth regression tests
+#[cfg(test)]
+mod multipart_auth_test;
+
+#[cfg(test)]
+mod stale_multipart_cleanup_cluster_test;
+
+// Object lambda end-to-end regression tests
+#[cfg(test)]
+mod object_lambda_test;
+
+// Replication extension end-to-end regression tests
+#[cfg(test)]
+mod replication_extension_test;
+
+#[cfg(test)]
+mod snowball_auto_extract_test;
+
+#[cfg(test)]
+mod namespace_lock_quorum_test;
+
+pub mod tls_gen;

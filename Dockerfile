@@ -1,4 +1,18 @@
-FROM alpine:3.22 AS build
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM alpine:3.23.4 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -15,8 +29,20 @@ RUN set -eux; \
     if [ "$RELEASE" = "latest" ]; then \
       TAG="$(curl -fsSL https://api.github.com/repos/rustfs/rustfs/releases \
               | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4 | head -n 1)"; \
+      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG")"; \
     else \
       TAG="$RELEASE"; \
+      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" 2>/dev/null || true)"; \
+      if [ -z "$RELEASE_JSON" ]; then \
+        if [ "${TAG#v}" = "$TAG" ]; then \
+          ALT_TAG="v$TAG"; \
+        else \
+          ALT_TAG="${TAG#v}"; \
+        fi; \
+        echo "Primary tag lookup failed, retrying with alternate tag: $ALT_TAG"; \
+        RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$ALT_TAG")"; \
+        TAG="$ALT_TAG"; \
+      fi; \
     fi; \
     echo "Using tag: $TAG (arch pattern: $ARCH_SUBSTR)"; \
     # Find download URL in assets list for this tag that contains arch substring and ends with .zip
@@ -40,7 +66,7 @@ RUN set -eux; \
     rm -rf rustfs.zip /build/.tmp || true
 
 
-FROM alpine:3.22
+FROM alpine:3.23.4
 
 ARG RELEASE=latest
 ARG BUILD_DATE
@@ -58,7 +84,8 @@ LABEL name="RustFS" \
       url="https://rustfs.com" \
       license="Apache-2.0"
 
-RUN apk add --no-cache ca-certificates coreutils curl
+RUN apk update && \
+    apk add --no-cache ca-certificates coreutils curl
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
@@ -72,16 +99,11 @@ RUN addgroup -g 10001 -S rustfs && \
     chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 
-ENV RUSTFS_ADDRESS=":9000" \
-    RUSTFS_CONSOLE_ADDRESS=":9001" \
-    RUSTFS_ACCESS_KEY="rustfsadmin" \
-    RUSTFS_SECRET_KEY="rustfsadmin" \
-    RUSTFS_CONSOLE_ENABLE="true" \
-    RUSTFS_EXTERNAL_ADDRESS="" \
-    RUSTFS_CORS_ALLOWED_ORIGINS="*" \
-    RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
+ENV RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_VOLUMES="/data" \
-    RUST_LOG="warn"
+    RUSTFS_OBS_LOGGER_LEVEL=warn \
+    RUSTFS_OBS_LOG_DIRECTORY=/logs \
+    RUSTFS_OBS_ENVIRONMENT=production
     
 EXPOSE 9000 9001
 

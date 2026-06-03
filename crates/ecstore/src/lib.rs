@@ -22,13 +22,13 @@ pub mod bucket;
 pub mod cache_value;
 pub mod compress;
 pub mod config;
+mod data_movement;
 pub mod data_usage;
 pub mod disk;
 pub mod disks_layout;
 pub mod endpoints;
 pub mod erasure_coding;
 pub mod error;
-pub mod file_cache;
 pub mod global;
 pub mod metrics_realtime;
 pub mod notification_sys;
@@ -47,11 +47,16 @@ pub mod store_utils;
 pub mod client;
 pub mod event;
 pub mod event_notification;
+#[cfg(test)]
+mod pools_test;
+#[cfg(test)]
+mod store_test;
 pub mod tier;
 
 pub use global::new_object_layer_fn;
 pub use global::set_global_endpoints;
 pub use global::update_erasure_type;
+pub use global::{get_global_lock_client, get_global_lock_clients, set_global_lock_client, set_global_lock_clients};
 
 pub use global::GLOBAL_Endpoints;
 pub use store_api::StorageAPI;

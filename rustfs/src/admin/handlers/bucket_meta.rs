@@ -12,21 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::HashMap,
-    io::{Cursor, Read as _, Write as _},
-};
-
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+    },
     auth::{check_key_valid, get_session_token},
-    server::RemoteAddr,
+    server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, StatusCode};
+use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
 use rustfs_ecstore::{
-    StorageAPI,
+    bucket::utils::{deserialize, serialize},
+    store_api::MakeBucketOptions,
+};
+use rustfs_ecstore::{
     bucket::{
         metadata::{
             BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
@@ -39,11 +41,7 @@ use rustfs_ecstore::{
     },
     error::StorageError,
     new_object_layer_fn,
-    store_api::BucketOptions,
-};
-use rustfs_ecstore::{
-    bucket::utils::{deserialize, serialize},
-    store_api::MakeBucketOptions,
+    store_api::{BucketOperations, BucketOptions},
 };
 use rustfs_policy::policy::{
     BucketPolicy,
@@ -61,6 +59,10 @@ use s3s::{
 };
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
+use std::{
+    collections::HashMap,
+    io::{Cursor, Read as _, Write as _},
+};
 use time::OffsetDateTime;
 use tracing::warn;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -71,6 +73,34 @@ pub struct ExportBucketMetadataQuery {
 }
 
 pub struct ExportBucketMetadata {}
+
+pub fn register_bucket_meta_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/export-bucket-metadata").as_str(),
+        AdminOperation(&ExportBucketMetadata {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/export-bucket-metadata").as_str(),
+        AdminOperation(&ExportBucketMetadata {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/import-bucket-metadata").as_str(),
+        AdminOperation(&ImportBucketMetadata {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/import-bucket-metadata").as_str(),
+        AdminOperation(&ImportBucketMetadata {}),
+    )?;
+
+    Ok(())
+}
 
 #[async_trait::async_trait]
 impl Operation for ExportBucketMetadata {
@@ -98,7 +128,7 @@ impl Operation for ExportBucketMetadata {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -391,7 +421,7 @@ impl Operation for ImportBucketMetadata {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 

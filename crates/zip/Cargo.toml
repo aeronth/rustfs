@@ -35,10 +35,13 @@ async-compression = { workspace = true, features = [
     "zstd",
     "xz",
 ] }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["io-uring","fs","io-util","macros"] }
 tokio-stream = { workspace = true }
 astral-tokio-tar = { workspace = true }
 
 
 [lints]
 workspace = true
+
+[lib]
+doctest = false

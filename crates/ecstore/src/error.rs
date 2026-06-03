@@ -12,196 +12,176 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::{S3Error, S3ErrorCode};
-
-use rustfs_utils::path::decode_dir_object;
-
 use crate::bucket::error::BucketMetadataError;
 use crate::disk::error::DiskError;
+use rustfs_utils::path::decode_dir_object;
+use s3s::{S3Error, S3ErrorCode};
 
 pub type Error = StorageError;
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// Storage layer error type covering disk, volume, bucket, object, multipart,
+/// erasure-coding, and operational error conditions.
+///
+/// Variants are organized by domain:
+///   - **Disk / Volume** – low-level storage I/O
+///   - **Bucket** – bucket-level operations
+///   - **Object** – object-level operations (including versioning)
+///   - **Multipart** – multipart upload lifecycle
+///   - **Erasure / Quorum** – erasure coding and quorum failures
+///   - **Operational** – decommission, healing, rate-limiting, etc.
+///   - **Generic** – I/O, locks, and catch-all errors
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    // ── Disk / Volume ────────────────────────────────────────────────
     #[error("Faulty disk")]
     FaultyDisk,
-
-    #[error("Disk full")]
-    DiskFull,
-
-    #[error("Volume not found")]
-    VolumeNotFound,
-
-    #[error("Volume exists")]
-    VolumeExists,
-
-    #[error("File not found")]
-    FileNotFound,
-
-    #[error("File version not found")]
-    FileVersionNotFound,
-
-    #[error("File name too long")]
-    FileNameTooLong,
-
-    #[error("File access denied")]
-    FileAccessDenied,
-
-    #[error("File is corrupted")]
-    FileCorrupt,
-
-    #[error("Not a regular file")]
-    IsNotRegular,
-
-    #[error("Volume not empty")]
-    VolumeNotEmpty,
-
-    #[error("Volume access denied")]
-    VolumeAccessDenied,
-
-    #[error("Corrupted format")]
-    CorruptedFormat,
-
-    #[error("Corrupted backend")]
-    CorruptedBackend,
-
-    #[error("Unformatted disk")]
-    UnformattedDisk,
-
-    #[error("Disk not found")]
-    DiskNotFound,
-
-    #[error("Drive is root")]
-    DriveIsRoot,
-
     #[error("Faulty remote disk")]
     FaultyRemoteDisk,
-
+    #[error("Disk full")]
+    DiskFull,
+    #[error("Disk not found")]
+    DiskNotFound,
     #[error("Disk access denied")]
     DiskAccessDenied,
-
-    #[error("Unexpected error")]
-    Unexpected,
-
+    #[error("Drive is root")]
+    DriveIsRoot,
+    #[error("Unformatted disk")]
+    UnformattedDisk,
+    #[error("Corrupted format")]
+    CorruptedFormat,
+    #[error("Corrupted backend")]
+    CorruptedBackend,
     #[error("Too many open files")]
     TooManyOpenFiles,
 
-    #[error("No heal required")]
-    NoHealRequired,
+    #[error("Volume not found")]
+    VolumeNotFound,
+    #[error("Volume exists")]
+    VolumeExists,
+    #[error("Volume not empty")]
+    VolumeNotEmpty,
+    #[error("Volume access denied")]
+    VolumeAccessDenied,
 
-    #[error("Config not found")]
-    ConfigNotFound,
+    #[error("File not found")]
+    FileNotFound,
+    #[error("File version not found")]
+    FileVersionNotFound,
+    #[error("File name too long")]
+    FileNameTooLong,
+    #[error("File access denied")]
+    FileAccessDenied,
+    #[error("File is corrupted")]
+    FileCorrupt,
+    #[error("Not a regular file")]
+    IsNotRegular,
 
-    #[error("not implemented")]
-    NotImplemented,
-
-    #[error("Invalid arguments provided for {0}/{1}-{2}")]
-    InvalidArgument(String, String, String),
-
-    #[error("method not allowed")]
-    MethodNotAllowed,
-
+    // ── Bucket ───────────────────────────────────────────────────────
     #[error("Bucket not found: {0}")]
     BucketNotFound(String),
-
+    #[error("Bucket exists: {0}")]
+    BucketExists(String),
     #[error("Bucket not empty: {0}")]
     BucketNotEmpty(String),
-
     #[error("Bucket name invalid: {0}")]
     BucketNameInvalid(String),
 
-    #[error("Object name invalid: {0}/{1}")]
-    ObjectNameInvalid(String, String),
-
-    #[error("Bucket exists: {0}")]
-    BucketExists(String),
-    #[error("Storage reached its minimum free drive threshold.")]
-    StorageFull,
-    #[error("Please reduce your request rate")]
-    SlowDown,
-
-    #[error("Prefix access is denied:{0}/{1}")]
-    PrefixAccessDenied(String, String),
-
-    #[error("Invalid UploadID KeyCombination: {0}/{1}")]
-    InvalidUploadIDKeyCombination(String, String),
-
-    #[error("Malformed UploadID: {0}")]
-    MalformedUploadID(String),
-
-    #[error("Object name too long: {0}/{1}")]
-    ObjectNameTooLong(String, String),
-
-    #[error("Object name contains forward slash as prefix: {0}/{1}")]
-    ObjectNamePrefixAsSlash(String, String),
-
+    // ── Object ───────────────────────────────────────────────────────
     #[error("Object not found: {0}/{1}")]
     ObjectNotFound(String, String),
-
+    #[error("Object name invalid: {0}/{1}")]
+    ObjectNameInvalid(String, String),
+    #[error("Object name too long: {0}/{1}")]
+    ObjectNameTooLong(String, String),
+    #[error("Object name contains forward slash as prefix: {0}/{1}")]
+    ObjectNamePrefixAsSlash(String, String),
+    #[error("Object exists on :{0} as directory {1}")]
+    ObjectExistsAsDirectory(String, String),
     #[error("Version not found: {0}/{1}-{2}")]
     VersionNotFound(String, String, String),
-
-    #[error("Invalid upload id: {0}/{1}-{2}")]
-    InvalidUploadID(String, String, String),
-
-    #[error("Specified part could not be found. PartNumber {0}, Expected {1}, got {2}")]
-    InvalidPart(usize, String, String),
-
-    #[error("Your proposed upload is smaller than the minimum allowed size. Part {0} size {1} is less than minimum {2}")]
-    EntityTooSmall(usize, i64, i64),
-
     #[error("Invalid version id: {0}/{1}-{2}")]
     InvalidVersionID(String, String, String),
     #[error("invalid data movement operation, source and destination pool are the same for : {0}/{1}-{2}")]
     DataMovementOverwriteErr(String, String, String),
+    #[error("Prefix access is denied:{0}/{1}")]
+    PrefixAccessDenied(String, String),
 
-    #[error("Object exists on :{0} as directory {1}")]
-    ObjectExistsAsDirectory(String, String),
+    // ── Multipart ────────────────────────────────────────────────────
+    #[error("Invalid upload id: {0}/{1}-{2}")]
+    InvalidUploadID(String, String, String),
+    #[error("Invalid UploadID KeyCombination: {0}/{1}")]
+    InvalidUploadIDKeyCombination(String, String),
+    #[error("Malformed UploadID: {0}")]
+    MalformedUploadID(String),
+    #[error("Specified part could not be found. PartNumber {0}, Expected {1}, got {2}")]
+    InvalidPart(usize, String, String),
+    #[error("Invalid part number: {0}")]
+    InvalidPartNumber(usize),
+    #[error("Your proposed upload is smaller than the minimum allowed size. Part {0} size {1} is less than minimum {2}")]
+    EntityTooSmall(usize, i64, i64),
 
+    // ── Erasure / Quorum ─────────────────────────────────────────────
+    #[error("erasure read quorum")]
+    ErasureReadQuorum,
+    #[error("erasure write quorum")]
+    ErasureWriteQuorum,
     #[error("Storage resources are insufficient for the read operation: {0}/{1}")]
     InsufficientReadQuorum(String, String),
-
     #[error("Storage resources are insufficient for the write operation: {0}/{1}")]
     InsufficientWriteQuorum(String, String),
+    #[error("not first disk")]
+    NotFirstDisk,
+    #[error("first disk wait")]
+    FirstDiskWait,
 
+    // ── Operational ──────────────────────────────────────────────────
+    #[error("Storage reached its minimum free drive threshold.")]
+    StorageFull,
+    #[error("Please reduce your request rate")]
+    SlowDown,
     #[error("Decommission not started")]
     DecommissionNotStarted,
     #[error("Decommission already running")]
     DecommissionAlreadyRunning,
-
+    #[error("Rebalance already running")]
+    RebalanceAlreadyRunning,
+    #[error("Operation canceled")]
+    OperationCanceled,
+    #[error("No heal required")]
+    NoHealRequired,
     #[error("DoneForNow")]
     DoneForNow,
-
-    #[error("erasure read quorum")]
-    ErasureReadQuorum,
-
-    #[error("erasure write quorum")]
-    ErasureWriteQuorum,
-
-    #[error("not first disk")]
-    NotFirstDisk,
-
-    #[error("first disk wait")]
-    FirstDiskWait,
-
-    #[error("Io error: {0}")]
-    Io(std::io::Error),
-
-    #[error("Lock error: {0}")]
-    Lock(#[from] rustfs_lock::LockError),
-
+    #[error("Config not found")]
+    ConfigNotFound,
     #[error("Precondition failed")]
     PreconditionFailed,
-
     #[error("Not modified")]
     NotModified,
-
-    #[error("Invalid part number: {0}")]
-    InvalidPartNumber(usize),
-
     #[error("Invalid range specified: {0}")]
     InvalidRangeSpec(String),
+    #[error("Namespace lock quorum unavailable for {mode} lock on {bucket}/{object}: required {required}, achieved {achieved}")]
+    NamespaceLockQuorumUnavailable {
+        mode: &'static str,
+        bucket: String,
+        object: String,
+        required: usize,
+        achieved: usize,
+    },
+
+    // ── Generic ──────────────────────────────────────────────────────
+    #[error("Unexpected error")]
+    Unexpected,
+    #[error("not implemented")]
+    NotImplemented,
+    #[error("Invalid arguments provided for {0}/{1}-{2}")]
+    InvalidArgument(String, String, String),
+    #[error("method not allowed")]
+    MethodNotAllowed,
+    #[error("Io error: {0}")]
+    Io(std::io::Error),
+    #[error("Lock error: {0}")]
+    Lock(#[from] rustfs_lock::LockError),
 }
 
 impl StorageError {
@@ -210,6 +190,30 @@ impl StorageError {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         StorageError::Io(std::io::Error::other(error))
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            StorageError::FileNotFound
+                | StorageError::ObjectNotFound(_, _)
+                | StorageError::FileVersionNotFound
+                | StorageError::VersionNotFound(_, _, _)
+                | StorageError::VolumeNotFound
+                | StorageError::DiskNotFound
+                | StorageError::BucketNotFound(_)
+        )
+    }
+
+    pub fn is_quorum_error(&self) -> bool {
+        matches!(
+            self,
+            StorageError::ErasureReadQuorum
+                | StorageError::ErasureWriteQuorum
+                | StorageError::InsufficientReadQuorum(_, _)
+                | StorageError::InsufficientWriteQuorum(_, _)
+                | StorageError::NamespaceLockQuorumUnavailable { .. }
+        )
     }
 }
 
@@ -423,6 +427,8 @@ impl Clone for StorageError {
             StorageError::EntityTooSmall(a, b, c) => StorageError::EntityTooSmall(*a, *b, *c),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
+            StorageError::RebalanceAlreadyRunning => StorageError::RebalanceAlreadyRunning,
+            StorageError::OperationCanceled => StorageError::OperationCanceled,
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageError::NotFirstDisk,
@@ -436,6 +442,19 @@ impl Clone for StorageError {
             StorageError::NotModified => StorageError::NotModified,
             StorageError::InvalidPartNumber(a) => StorageError::InvalidPartNumber(*a),
             StorageError::InvalidRangeSpec(a) => StorageError::InvalidRangeSpec(a.clone()),
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode,
+                bucket,
+                object,
+                required,
+                achieved,
+            } => StorageError::NamespaceLockQuorumUnavailable {
+                mode,
+                bucket: bucket.clone(),
+                object: object.clone(),
+                required: *required,
+                achieved: *achieved,
+            },
         }
     }
 }
@@ -491,6 +510,8 @@ impl StorageError {
             StorageError::InvalidPart(_, _, _) => 0x2E,
             StorageError::DoneForNow => 0x2F,
             StorageError::DecommissionAlreadyRunning => 0x30,
+            StorageError::RebalanceAlreadyRunning => 0x40,
+            StorageError::OperationCanceled => 0x41,
             StorageError::ErasureReadQuorum => 0x31,
             StorageError::ErasureWriteQuorum => 0x32,
             StorageError::NotFirstDisk => 0x33,
@@ -506,6 +527,7 @@ impl StorageError {
             StorageError::InvalidRangeSpec(_) => 0x3D,
             StorageError::NotModified => 0x3E,
             StorageError::InvalidPartNumber(_) => 0x3F,
+            StorageError::NamespaceLockQuorumUnavailable { .. } => 0x42,
         }
     }
 
@@ -563,6 +585,8 @@ impl StorageError {
             0x2E => Some(StorageError::InvalidPart(Default::default(), Default::default(), Default::default())),
             0x2F => Some(StorageError::DoneForNow),
             0x30 => Some(StorageError::DecommissionAlreadyRunning),
+            0x40 => Some(StorageError::RebalanceAlreadyRunning),
+            0x41 => Some(StorageError::OperationCanceled),
             0x31 => Some(StorageError::ErasureReadQuorum),
             0x32 => Some(StorageError::ErasureWriteQuorum),
             0x33 => Some(StorageError::NotFirstDisk),
@@ -578,6 +602,13 @@ impl StorageError {
             0x3D => Some(StorageError::InvalidRangeSpec(Default::default())),
             0x3E => Some(StorageError::NotModified),
             0x3F => Some(StorageError::InvalidPartNumber(Default::default())),
+            0x42 => Some(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: Default::default(),
+                object: Default::default(),
+                required: Default::default(),
+                achieved: Default::default(),
+            }),
             _ => None,
         }
     }
@@ -677,6 +708,18 @@ pub fn is_err_read_quorum(err: &Error) -> bool {
     matches!(err, &StorageError::ErasureReadQuorum)
 }
 
+pub fn classify_system_path_failure_reason(err: &Error) -> &'static str {
+    match err {
+        StorageError::ConfigNotFound => "config_not_found",
+        StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => "read_quorum",
+        StorageError::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::TimedOut => "timeout",
+            _ => "io",
+        },
+        _ => "other",
+    }
+}
+
 pub fn is_err_invalid_upload_id(err: &Error) -> bool {
     matches!(err, &StorageError::InvalidUploadID(_, _, _))
 }
@@ -689,6 +732,22 @@ pub fn is_err_bucket_not_found(err: &Error) -> bool {
 
 pub fn is_err_data_movement_overwrite(err: &Error) -> bool {
     matches!(err, &StorageError::DataMovementOverwriteErr(_, _, _))
+}
+
+pub fn is_err_decommission_running(err: &Error) -> bool {
+    matches!(err, &StorageError::DecommissionAlreadyRunning)
+}
+
+pub fn is_err_rebalance_running(err: &Error) -> bool {
+    matches!(err, &StorageError::RebalanceAlreadyRunning)
+}
+
+pub fn is_err_operation_canceled(err: &Error) -> bool {
+    matches!(err, &StorageError::OperationCanceled)
+}
+
+pub fn is_err_not_initialized(err: &Error) -> bool {
+    err.to_string().contains("errServerNotInitialized") || err.to_string().contains("ServerNotInitialized")
 }
 
 pub fn is_err_io(err: &Error) -> bool {
@@ -725,24 +784,6 @@ pub fn is_all_volume_not_found(errs: &[Option<Error>]) -> bool {
 
     !errs.is_empty()
 }
-
-// pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
-//     for err in errs.iter() {
-//         if let Some(err) = err {
-//             if let Some(err) = err.downcast_ref::<DiskError>() {
-//                 match err {
-//                     DiskError::FileNotFound | DiskError::VolumeNotFound | &DiskError::FileVersionNotFound => {
-//                         continue;
-//                     }
-//                     _ => return false,
-//                 }
-//             }
-//         }
-//         return false;
-//     }
-
-//     !errs.is_empty()
-// }
 
 pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
     match err {
@@ -940,10 +981,6 @@ pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
         object = decode_dir_object(params[1]);
     }
     match storage_err {
-        /*StorageError::NotImplemented => s3_error!(NotImplemented),
-        StorageError::InvalidArgument(bucket, object, version_id) => {
-            s3_error!(InvalidArgument, "Invalid arguments provided for {}/{}-{}", bucket, object, version_id)
-        }*/
         StorageError::MethodNotAllowed => S3Error::with_message(
             S3ErrorCode::MethodNotAllowed,
             ObjectApiError::MethodNotAllowed(GenericError {
@@ -953,73 +990,6 @@ pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
             })
             .to_string(),
         ),
-        /*StorageError::BucketNotFound(bucket) => {
-            s3_error!(NoSuchBucket, "bucket not found {}", bucket)
-        }
-        StorageError::BucketNotEmpty(bucket) => s3_error!(BucketNotEmpty, "bucket not empty {}", bucket),
-        StorageError::BucketNameInvalid(bucket) => s3_error!(InvalidBucketName, "invalid bucket name {}", bucket),
-        StorageError::ObjectNameInvalid(bucket, object) => {
-            s3_error!(InvalidArgument, "invalid object name {}/{}", bucket, object)
-        }
-        StorageError::BucketExists(bucket) => s3_error!(BucketAlreadyExists, "{}", bucket),
-        StorageError::StorageFull => s3_error!(ServiceUnavailable, "Storage reached its minimum free drive threshold."),
-        StorageError::SlowDown => s3_error!(SlowDown, "Please reduce your request rate"),
-        StorageError::PrefixAccessDenied(bucket, object) => {
-            s3_error!(AccessDenied, "PrefixAccessDenied {}/{}", bucket, object)
-        }
-        StorageError::InvalidUploadIDKeyCombination(bucket, object) => {
-            s3_error!(InvalidArgument, "Invalid UploadID KeyCombination:  {}/{}", bucket, object)
-        }
-        StorageError::MalformedUploadID(bucket) => s3_error!(InvalidArgument, "Malformed UploadID: {}", bucket),
-        StorageError::ObjectNameTooLong(bucket, object) => {
-            s3_error!(InvalidArgument, "Object name too long: {}/{}", bucket, object)
-        }
-        StorageError::ObjectNamePrefixAsSlash(bucket, object) => {
-            s3_error!(InvalidArgument, "Object name contains forward slash as prefix: {}/{}", bucket, object)
-        }
-        StorageError::ObjectNotFound(bucket, object) => s3_error!(NoSuchKey, "{}/{}", bucket, object),
-        StorageError::VersionNotFound(bucket, object, version_id) => {
-            s3_error!(NoSuchVersion, "{}/{}/{}", bucket, object, version_id)
-        }
-        StorageError::InvalidUploadID(bucket, object, version_id) => {
-            s3_error!(InvalidPart, "Invalid upload id:  {}/{}-{}", bucket, object, version_id)
-        }
-        StorageError::InvalidVersionID(bucket, object, version_id) => {
-            s3_error!(InvalidArgument, "Invalid version id: {}/{}-{}", bucket, object, version_id)
-        }
-        // extended
-        StorageError::DataMovementOverwriteErr(bucket, object, version_id) => s3_error!(
-            InvalidArgument,
-            "invalid data movement operation, source and destination pool are the same for : {}/{}-{}",
-            bucket,
-            object,
-            version_id
-        ),
-        // extended
-        StorageError::ObjectExistsAsDirectory(bucket, object) => {
-            s3_error!(InvalidArgument, "Object exists on :{} as directory {}", bucket, object)
-        }
-        StorageError::InsufficientReadQuorum => {
-            s3_error!(SlowDown, "Storage resources are insufficient for the read operation")
-        }
-        StorageError::InsufficientWriteQuorum => {
-            s3_error!(SlowDown, "Storage resources are insufficient for the write operation")
-        }
-        StorageError::DecommissionNotStarted => s3_error!(InvalidArgument, "Decommission Not Started"),
-
-        StorageError::VolumeNotFound(bucket) => {
-            s3_error!(NoSuchBucket, "bucket not found {}", bucket)
-        }
-        StorageError::InvalidPart(bucket, object, version_id) => {
-            s3_error!(
-                InvalidPart,
-                "Specified part could not be found. PartNumber {}, Expected {}, got {}",
-                bucket,
-                object,
-                version_id
-            )
-        }
-        StorageError::DoneForNow => s3_error!(InternalError, "DoneForNow"),*/
         _ => s3s::S3Error::with_message(S3ErrorCode::Custom("err".into()), err.to_string()),
     }
 }
@@ -1042,6 +1012,19 @@ mod tests {
         assert_eq!(StorageError::VolumeExists.to_u32(), 0x05);
         assert_eq!(StorageError::FileNotFound.to_u32(), 0x06);
         assert_eq!(StorageError::DecommissionAlreadyRunning.to_u32(), 0x30);
+        assert_eq!(StorageError::RebalanceAlreadyRunning.to_u32(), 0x40);
+        assert_eq!(StorageError::OperationCanceled.to_u32(), 0x41);
+        assert_eq!(
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: "bucket".into(),
+                object: "object".into(),
+                required: 3,
+                achieved: 2,
+            }
+            .to_u32(),
+            0x42
+        );
     }
 
     #[test]
@@ -1054,6 +1037,12 @@ mod tests {
         assert!(matches!(StorageError::from_u32(0x03), Some(StorageError::DiskFull)));
         assert!(matches!(StorageError::from_u32(0x04), Some(StorageError::VolumeNotFound)));
         assert!(matches!(StorageError::from_u32(0x30), Some(StorageError::DecommissionAlreadyRunning)));
+        assert!(matches!(StorageError::from_u32(0x40), Some(StorageError::RebalanceAlreadyRunning)));
+        assert!(matches!(StorageError::from_u32(0x41), Some(StorageError::OperationCanceled)));
+        assert!(matches!(
+            StorageError::from_u32(0x42),
+            Some(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
 
         // Test invalid code returns None
         assert!(StorageError::from_u32(0xFF).is_none());
@@ -1076,6 +1065,42 @@ mod tests {
 
         let disk_error = StorageError::DiskFull;
         assert_ne!(bucket1, disk_error);
+    }
+
+    #[test]
+    fn test_error_running_state_helpers() {
+        assert!(is_err_decommission_running(&StorageError::DecommissionAlreadyRunning));
+        assert!(!is_err_decommission_running(&StorageError::RebalanceAlreadyRunning));
+
+        assert!(is_err_rebalance_running(&StorageError::RebalanceAlreadyRunning));
+        assert!(!is_err_rebalance_running(&StorageError::DecommissionAlreadyRunning));
+        assert!(is_err_operation_canceled(&StorageError::OperationCanceled));
+        assert!(!is_err_operation_canceled(&StorageError::RebalanceAlreadyRunning));
+        assert!(is_err_not_initialized(&StorageError::other("errServerNotInitialized")));
+        assert!(is_err_not_initialized(&StorageError::other("ServerNotInitialized")));
+        assert!(!is_err_not_initialized(&StorageError::DecommissionAlreadyRunning));
+    }
+
+    #[test]
+    fn test_classify_system_path_failure_reason() {
+        assert_eq!(classify_system_path_failure_reason(&StorageError::ConfigNotFound), "config_not_found");
+        assert_eq!(classify_system_path_failure_reason(&StorageError::ErasureReadQuorum), "read_quorum");
+        assert_eq!(
+            classify_system_path_failure_reason(&StorageError::InsufficientReadQuorum(
+                "bucket".to_string(),
+                "object".to_string()
+            )),
+            "read_quorum"
+        );
+        assert_eq!(
+            classify_system_path_failure_reason(&StorageError::Io(IoError::new(ErrorKind::TimedOut, "probe"))),
+            "timeout"
+        );
+        assert_eq!(
+            classify_system_path_failure_reason(&StorageError::Io(IoError::new(ErrorKind::PermissionDenied, "probe"))),
+            "io"
+        );
+        assert_eq!(classify_system_path_failure_reason(&StorageError::DiskFull), "other");
     }
 
     #[test]
@@ -1165,6 +1190,8 @@ mod tests {
             StorageError::BucketExists("test".to_string()),
             StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
             StorageError::DecommissionAlreadyRunning,
+            StorageError::RebalanceAlreadyRunning,
+            StorageError::OperationCanceled,
         ];
 
         for original_error in test_errors {
@@ -1225,7 +1252,7 @@ mod tests {
     fn test_io_error_with_disk_error_inside() {
         // Test io::Error containing DiskError -> StorageError conversion
         let original_disk_error = DiskError::FileNotFound;
-        let io_with_disk_error = std::io::Error::other(original_disk_error.clone());
+        let io_with_disk_error = std::io::Error::other(original_disk_error);
 
         // Convert io::Error to StorageError
         let storage_error: StorageError = io_with_disk_error.into();

@@ -14,13 +14,11 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
-#[cfg(test)]
-use std::sync::MutexGuard;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     io::Error,
-    net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
     sync::{Arc, LazyLock, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -28,7 +26,7 @@ use tracing::{error, info};
 use transform_stream::AsyncTryStream;
 use url::{Host, Url};
 
-static LOCAL_IPS: LazyLock<Vec<IpAddr>> = LazyLock::new(|| must_get_local_ips().unwrap());
+static LOCAL_IPS: LazyLock<Vec<IpAddr>> = LazyLock::new(get_local_ips_with_fallback);
 
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
@@ -55,7 +53,7 @@ type DynDnsResolver = dyn Fn(&str) -> std::io::Result<HashSet<IpAddr>> + Send + 
 static CUSTOM_DNS_RESOLVER: LazyLock<RwLock<Option<Arc<DynDnsResolver>>>> = LazyLock::new(|| RwLock::new(None));
 
 fn resolve_domain(domain: &str) -> std::io::Result<HashSet<IpAddr>> {
-    if let Some(resolver) = CUSTOM_DNS_RESOLVER.read().unwrap().clone() {
+    if let Some(resolver) = get_custom_dns_resolver() {
         return resolver(domain);
     }
 
@@ -83,7 +81,7 @@ fn reset_dns_resolver_inner() {
 
 #[cfg(test)]
 pub struct MockResolverGuard {
-    _lock: MutexGuard<'static, ()>,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
@@ -112,9 +110,35 @@ pub fn reset_dns_resolver() {
 
 /// helper for validating if the provided arg is an ip address.
 pub fn is_socket_addr(addr: &str) -> bool {
-    // TODO IPv6 zone information?
+    addr.parse::<SocketAddr>().is_ok() || addr.parse::<IpAddr>().is_ok() || is_ipv6_addr_with_zone(addr)
+}
 
-    addr.parse::<SocketAddr>().is_ok() || addr.parse::<IpAddr>().is_ok()
+fn is_ipv6_addr_with_zone(addr: &str) -> bool {
+    let Some(zone_start) = addr.find('%') else {
+        return false;
+    };
+
+    if addr.starts_with('[') {
+        let Some(end_bracket) = addr[zone_start..].find(']').map(|pos| zone_start + pos) else {
+            return false;
+        };
+        let zone = &addr[zone_start + 1..end_bracket];
+        return zone_start > 1
+            && is_valid_ipv6_zone(zone)
+            && addr[end_bracket..].starts_with("]:")
+            && addr[1..zone_start].parse::<Ipv6Addr>().is_ok()
+            && addr[end_bracket + 2..].parse::<u16>().is_ok();
+    }
+
+    let zone = &addr[zone_start + 1..];
+    zone_start > 0 && is_valid_ipv6_zone(zone) && addr[..zone_start].parse::<Ipv6Addr>().is_ok()
+}
+
+fn is_valid_ipv6_zone(zone: &str) -> bool {
+    !zone.is_empty()
+        && zone
+            .bytes()
+            .all(|ch| matches!(ch, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'))
 }
 
 /// checks if server_addr is valid and local host.
@@ -166,6 +190,28 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
     Ok(is_local_host)
 }
 
+fn get_custom_dns_resolver() -> Option<Arc<DynDnsResolver>> {
+    match CUSTOM_DNS_RESOLVER.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            error!("CUSTOM_DNS_RESOLVER RwLock is poisoned; using resolver value despite poisoning");
+            let guard = poisoned.into_inner();
+            guard.clone()
+        }
+    }
+}
+
+fn has_custom_dns_resolver() -> bool {
+    get_custom_dns_resolver().is_some()
+}
+
+fn get_local_ips_with_fallback() -> Vec<IpAddr> {
+    match must_get_local_ips() {
+        Ok(ips) if !ips.is_empty() => ips,
+        _ => vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), IpAddr::V6(Ipv6Addr::LOCALHOST)],
+    }
+}
+
 /// returns IP address of given host using layered DNS resolution.
 ///
 /// This is the async version of `get_host_ip()` that provides enhanced DNS resolution
@@ -174,16 +220,15 @@ pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {
             // Check cache first
-            if CUSTOM_DNS_RESOLVER.read().unwrap().is_none() {
-                if let Ok(mut cache) = DNS_CACHE.lock() {
-                    if let Some(entry) = cache.get(domain) {
-                        if !entry.is_expired(DNS_CACHE_TTL) {
-                            return Ok(entry.ips.clone());
-                        }
-                        // Remove expired entry
-                        cache.remove(domain);
-                    }
+            if !has_custom_dns_resolver()
+                && let Ok(mut cache) = DNS_CACHE.lock()
+                && let Some(entry) = cache.get(domain)
+            {
+                if !entry.is_expired(DNS_CACHE_TTL) {
+                    return Ok(entry.ips.clone());
                 }
+                // Remove expired entry
+                cache.remove(domain);
             }
 
             info!("Cache miss for domain {domain}, querying system resolver.");
@@ -191,7 +236,7 @@ pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
             // Fallback to standard resolution when DNS resolver is not available
             match resolve_domain(domain) {
                 Ok(ips) => {
-                    if CUSTOM_DNS_RESOLVER.read().unwrap().is_none() {
+                    if !has_custom_dns_resolver() {
                         // Cache the result
                         if let Ok(mut cache) = DNS_CACHE.lock() {
                             cache.insert(domain.to_string(), DnsCacheEntry::new(ips.clone()));
@@ -216,7 +261,16 @@ pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
 }
 
 pub fn get_available_port() -> u16 {
-    TcpListener::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port()
+    try_get_available_port().unwrap_or_default()
+}
+
+fn try_get_available_port() -> std::io::Result<u16> {
+    let listener =
+        TcpListener::bind("0.0.0.0:0").map_err(|err| Error::other(format!("Failed to bind for ephemeral port: {err}")))?;
+    listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|err| Error::other(format!("Failed to read ephemeral port: {err}")))
 }
 
 /// returns IPs of local interface
@@ -228,7 +282,11 @@ pub fn must_get_local_ips() -> std::io::Result<Vec<IpAddr>> {
 }
 
 pub fn get_default_location(_u: Url, _region_override: &str) -> String {
-    todo!();
+    if !_region_override.is_empty() {
+        return _region_override.to_string();
+    }
+
+    _u.host().map(|host| host.to_string()).unwrap_or_default()
 }
 
 pub fn get_endpoint_url(endpoint: &str, secure: bool) -> Result<Url, Error> {
@@ -296,7 +354,7 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
             .parse()
             .map_err(|e| Error::other(format!("Invalid port format: {addr_str}, err:{e:?}")))?;
         let final_port = if port == 0 {
-            get_available_port() // assume get_available_port is available here
+            try_get_available_port()? // assume get_available_port is available here
         } else {
             port
         };
@@ -304,7 +362,7 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
     } else {
         let mut addr = check_local_server_addr(addr_str)?; // assume check_local_server_addr is available here
         if addr.port() == 0 {
-            addr.set_port(get_available_port());
+            addr.set_port(try_get_available_port()?);
         }
         addr
     };
@@ -675,5 +733,14 @@ mod test {
             is_port_set: true,
         };
         assert_eq!(host_zero_port.to_string(), "example.com:0");
+    }
+
+    #[test]
+    fn test_is_socket_addr_accepts_ipv6_zone_identifier() {
+        assert!(is_socket_addr("fe80::1%en0"));
+        assert!(is_socket_addr("[fe80::1%en0]:9000"));
+        assert!(!is_socket_addr("fe80::1%en0:9000"));
+        assert!(!is_socket_addr("fe80::1%en0 "));
+        assert!(!is_socket_addr("fe80::1%\t"));
     }
 }

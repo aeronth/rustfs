@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationSystem};
+use crate::{
+    BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationMetricSnapshot,
+    NotificationSystem, NotificationTargetMetricSnapshot,
+};
 use rustfs_ecstore::config::Config;
-use rustfs_targets::{EventName, arn::TargetID};
+use rustfs_s3_types::EventName;
+use rustfs_targets::arn::TargetID;
 use std::sync::{Arc, OnceLock};
 use tracing::error;
 
@@ -34,10 +38,41 @@ pub async fn initialize(config: Config) -> Result<(), NotificationError> {
     }
 }
 
+/// Initialize the global notification system only for live in-process consumers.
+///
+/// This does not load configured notification targets or bucket rules. It exists so
+/// ListenBucketNotification clients can receive live events even when external
+/// notification targets are disabled.
+pub fn initialize_live_events() -> Result<(), NotificationError> {
+    let system = NotificationSystem::new(Config::new());
+
+    match NOTIFICATION_SYSTEM.set(Arc::new(system)) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized)),
+    }
+}
+
 /// Returns a handle to the global NotificationSystem instance.
 /// Return None if the system has not been initialized.
 pub fn notification_system() -> Option<Arc<NotificationSystem>> {
     NOTIFICATION_SYSTEM.get().cloned()
+}
+
+/// Returns aggregate notification delivery metrics for Prometheus collection.
+pub fn notification_metrics_snapshot() -> NotificationMetricSnapshot {
+    NOTIFICATION_SYSTEM
+        .get()
+        .map(|system| system.snapshot_metrics())
+        .unwrap_or_default()
+}
+
+/// Returns per-target notification delivery metrics for Prometheus collection.
+pub async fn notification_target_metrics() -> Vec<NotificationTargetMetricSnapshot> {
+    if let Some(system) = notification_system() {
+        system.snapshot_target_metrics().await
+    } else {
+        Vec::new()
+    }
 }
 
 /// Check if the notification system has been initialized.
@@ -77,12 +112,6 @@ pub mod notifier_global {
             return;
         }
 
-        // Check if any subscribers are interested in the event
-        if !notification_sys.has_subscriber(&args.bucket_name, &args.event_name).await {
-            // error!("No subscribers for event: {} in bucket: {}", args.event_name, args.bucket_name);
-            return;
-        }
-
         // Create an event and send it
         let event = Arc::new(Event::new(args));
         notification_sys.send_event(event).await;
@@ -110,15 +139,11 @@ pub mod notifier_global {
         suffix: &str,
         target_ids: &[TargetID],
     ) -> Result<(), NotificationError> {
-        // Construct pattern, simple splicing of prefixes and suffixes
-        let mut pattern = String::new();
-        if !prefix.is_empty() {
-            pattern.push_str(prefix);
-        }
-        pattern.push('*');
-        if !suffix.is_empty() {
-            pattern.push_str(suffix);
-        }
+        // Construct pattern using proper pattern function
+        let pattern = crate::rules::pattern::new_pattern(
+            if prefix.is_empty() { None } else { Some(prefix) },
+            if suffix.is_empty() { None } else { Some(suffix) },
+        );
 
         // Create BucketNotificationConfig
         let mut bucket_config = BucketNotificationConfig::new(region);
